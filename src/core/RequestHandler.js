@@ -3565,12 +3565,42 @@ class RequestHandler {
 
     async _streamOpenAIResponse(messageQueue, res, model, requestId) {
         const streamState = {};
+        let sawNormalFinish = false;
+        let dataChunkCount = 0;
 
         try {
             // eslint-disable-next-line no-constant-condition
             while (true) {
                 const message = await messageQueue.dequeue(this.timeouts.STREAM_CHUNK);
                 if (message.type === "STREAM_END") {
+                    this.logger.info(
+                        `[Request] Upstream stream end received (normal finishReason: ${sawNormalFinish ? "yes" : "no"}, chunks: ${dataChunkCount}), request ID: ${requestId}`
+                    );
+                    if (!sawNormalFinish) {
+                        const incompleteError = new Error(
+                            "Upstream stream ended before a normal finishReason was received; partial response is incomplete."
+                        );
+                        incompleteError.status = 502;
+                        this._markTrackedResponseError(res, incompleteError.message, incompleteError.status);
+                        if (this._isResponseWritable(res)) {
+                            try {
+                                res.write(
+                                    `data: ${JSON.stringify({
+                                        error: {
+                                            code: incompleteError.status,
+                                            message: incompleteError.message,
+                                            type: "incomplete_stream_error",
+                                        },
+                                    })}\n\n`
+                                );
+                            } catch (writeError) {
+                                this.logger.debug(
+                                    `[Request] Failed to write incomplete-stream error: ${writeError.message}`
+                                );
+                            }
+                        }
+                        break;
+                    }
                     if (this._isResponseWritable(res)) {
                         try {
                             res.write("data: [DONE]\n\n");
@@ -3604,6 +3634,21 @@ class RequestHandler {
                 }
 
                 if (message.data) {
+                    dataChunkCount += 1;
+                    try {
+                        const parsedChunk = JSON.parse(
+                            message.data.replace(/^data:\s*/, "").trim()
+                        );
+                        const candidate = parsedChunk?.candidates?.[0];
+                        if (candidate?.finishReason) {
+                            sawNormalFinish = true;
+                            this.logger.info(
+                                `[Request] Upstream finishReason=${candidate.finishReason} received (chunks: ${dataChunkCount}), request ID: ${requestId}`
+                            );
+                        }
+                    } catch {
+                        // A fragmented/non-JSON chunk is passed to the normal converter.
+                    }
                     const openAIChunk = this.formatConverter.translateGoogleToOpenAIStream(
                         message.data,
                         model,
