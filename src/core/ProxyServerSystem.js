@@ -1,0 +1,661 @@
+/**
+ * File: src/core/ProxyServerSystem.js
+ * Description: Main proxy server system that orchestrates all components including HTTP/WebSocket servers, authentication, and request handling
+ *
+ * Author: Ellinav, iBenzene, bbbugg
+ */
+
+const { EventEmitter } = require("events");
+const express = require("express");
+const WebSocket = require("ws");
+const http = require("http");
+const https = require("https");
+const fs = require("fs");
+const net = require("net");
+const path = require("path");
+const { URL } = require("url");
+
+const LoggingService = require("../utils/LoggingService");
+const AuthSource = require("../auth/AuthSource");
+const BrowserManager = require("./BrowserManager");
+const ConnectionRegistry = require("./ConnectionRegistry");
+const RequestHandler = require("./RequestHandler");
+const UsageStatsService = require("./UsageStatsService");
+const ConfigLoader = require("../utils/ConfigLoader");
+const WebRoutes = require("../routes/WebRoutes");
+
+/**
+ * Proxy Server System
+ * Main server system class that integrates all modules
+ */
+class ProxyServerSystem extends EventEmitter {
+    constructor() {
+        super();
+        this.logger = new LoggingService("AIStudioToAPI");
+
+        const configLoader = new ConfigLoader(this.logger);
+        this.config = configLoader.loadConfiguration();
+
+        this.authSource = new AuthSource(this.logger);
+        this.browserManager = new BrowserManager(this.logger, this.config, this.authSource);
+        this.usageStatsService = new UsageStatsService(
+            this.authSource,
+            this.logger,
+            path.join(process.cwd(), "data"),
+            this.config.enableUsageStats
+        );
+
+        // Create ConnectionRegistry with lightweight reconnect callback
+        // When WebSocket connection is lost but browser is still running,
+        // this callback attempts to refresh the page and re-inject the script
+        this.connectionRegistry = new ConnectionRegistry(
+            this.logger,
+            async authIndex => {
+                // Skip if browser is being intentionally closed (not an unexpected disconnect)
+                if (this.browserManager.isClosingIntentionally) {
+                    this.logger.info("[System] Browser is closing intentionally, skipping reconnect attempt.");
+                    return;
+                }
+
+                // Check if this is the current account
+                const currentAuthIndex = this.browserManager.currentAuthIndex;
+                const isCurrentAccount = authIndex === currentAuthIndex;
+
+                // Only check isSystemBusy if this is the current account
+                if (isCurrentAccount && this.requestHandler?.isSystemBusy) {
+                    this.logger.info(
+                        `[System] Current account #${authIndex} is busy (switching/recovering), skipping lightweight reconnect attempt.`
+                    );
+                    return;
+                }
+
+                // Get the context and page for this specific account
+                const contextData = this.browserManager.contexts.get(authIndex);
+                if (!contextData || !contextData.page || contextData.page.isClosed()) {
+                    this.logger.info(
+                        `[System] Account #${authIndex} page not available or closed, skipping lightweight reconnect.`
+                    );
+                    return;
+                }
+
+                if (this.browserManager.browser) {
+                    this.logger.error(
+                        `[System] WebSocket lost for account #${authIndex} but browser still running, attempting lightweight reconnect...`
+                    );
+                    const success = await this.browserManager.attemptLightweightReconnect(authIndex);
+                    if (!success) {
+                        this.logger.warn(
+                            `[System] Lightweight reconnect failed for account #${authIndex}. Will attempt full recovery on next request.`
+                        );
+                    }
+                } else {
+                    this.logger.info("[System] Browser not available, skipping lightweight reconnect.");
+                }
+            },
+            () => this.browserManager.currentAuthIndex,
+            this.browserManager
+        );
+
+        // Set ConnectionRegistry reference in BrowserManager to avoid circular dependency
+        this.browserManager.setConnectionRegistry(this.connectionRegistry);
+
+        this.requestHandler = new RequestHandler(
+            this,
+            this.connectionRegistry,
+            this.logger,
+            this.browserManager,
+            this.config,
+            this.authSource
+        );
+        this.browserManager.setSystemBusyProvider(() => this.requestHandler?.isSystemBusy === true);
+
+        this.httpServer = null;
+        this.wsServer = null;
+        this.webRoutes = new WebRoutes(this);
+    }
+
+    async start(initialAuthIndex = null) {
+        this.logger.info("[System] Starting flexible startup process...");
+        await this._startHttpServer();
+        await this._startWebSocketServer();
+        this.logger.info(`[System] Proxy server system startup complete.`);
+
+        // Start periodic cleanup of stale message queues (every 5 minutes)
+        // This is a safety mechanism to prevent queue leaks from race conditions
+        this.staleQueueCleanupInterval = setInterval(() => {
+            try {
+                this.connectionRegistry.cleanupStaleQueues(600000); // 10 minutes
+            } catch (error) {
+                this.logger.error(`[System] Error during stale queue cleanup: ${error.message}`);
+            }
+        }, 300000); // Run every 5 minutes
+
+        const allAvailableIndices = this.authSource.availableIndices;
+        const allRotationIndices = this.authSource.getRotationIndices();
+
+        if (allAvailableIndices.length === 0) {
+            this.logger.warn("[System] No available authentication source. Starting in account binding mode.");
+            this.emit("started");
+            return; // Exit early
+        }
+
+        // Determine startup order
+        let startupOrder = allRotationIndices.length > 0 ? [...allRotationIndices] : [...allAvailableIndices];
+        const hasInitialAuthIndex = Number.isInteger(initialAuthIndex);
+        if (hasInitialAuthIndex) {
+            const canonicalInitialIndex = this.authSource.getCanonicalIndex(initialAuthIndex);
+            if (canonicalInitialIndex !== null && startupOrder.includes(canonicalInitialIndex)) {
+                if (canonicalInitialIndex !== initialAuthIndex) {
+                    this.logger.warn(
+                        `[System] Specified startup index #${initialAuthIndex} is a duplicate, using latest auth index #${canonicalInitialIndex} instead.`
+                    );
+                } else {
+                    this.logger.info(
+                        `[System] Detected specified startup index #${initialAuthIndex}, will try it first.`
+                    );
+                }
+                startupOrder = [canonicalInitialIndex, ...startupOrder.filter(i => i !== canonicalInitialIndex)];
+            } else {
+                this.logger.warn(
+                    `[System] Specified startup index #${initialAuthIndex} is invalid or unavailable, will start in default order.`
+                );
+            }
+        } else {
+            this.logger.info(
+                `[System] No valid startup index specified, will activate first available context [${startupOrder[0]}].`
+            );
+        }
+
+        // Context pool startup
+        const maxContexts = this.config.maxContexts;
+        this.logger.info(`[System] Starting context pool (maxContexts=${maxContexts})...`);
+
+        try {
+            this.requestHandler.authSwitcher.isSystemBusy = true;
+            const { firstReady } = await this.browserManager.preloadContextPool(startupOrder, maxContexts);
+
+            if (firstReady === null) {
+                this.logger.error("[System] Failed to initialize any context!");
+                this.emit("started");
+                return;
+            }
+
+            // Activate first ready context (fast switch since already preloaded)
+            await this.browserManager.launchOrSwitchContext(firstReady);
+            this.logger.info(`[System] ✅ Successfully activated account #${firstReady}!`);
+        } catch (error) {
+            this.logger.error(`[System] ❌ Startup failed: ${error.message}`);
+        } finally {
+            this.requestHandler.authSwitcher.isSystemBusy = false;
+        }
+
+        this.emit("started");
+    }
+
+    _createAuthMiddleware() {
+        return (req, res, next) => {
+            // Allow access if session is authenticated (e.g. browser accessing /vnc or API from UI)
+            if (req.session && req.session.isAuthenticated) {
+                if (req.path === "/vnc") {
+                    return next();
+                }
+            }
+
+            const serverApiKeys = this.config.apiKeys;
+            if (!serverApiKeys || serverApiKeys.length === 0) {
+                return next();
+            }
+
+            let clientKey = null;
+            if (req.headers["x-goog-api-key"]) {
+                clientKey = req.headers["x-goog-api-key"];
+            } else if (req.headers.authorization && req.headers.authorization.startsWith("Bearer ")) {
+                clientKey = req.headers.authorization.substring(7);
+            } else if (req.headers["x-api-key"]) {
+                clientKey = req.headers["x-api-key"];
+            } else if (req.query.key) {
+                clientKey = req.query.key;
+            }
+
+            if (clientKey && serverApiKeys.includes(clientKey)) {
+                this.logger.info(
+                    `[Auth] API Key verification passed (from: ${this.webRoutes.authRoutes.getClientIP(req)})`
+                );
+                if (req.query.key) {
+                    delete req.query.key;
+                }
+                return next();
+            }
+
+            if (req.path !== "/favicon.ico") {
+                const clientIp = this.webRoutes.authRoutes.getClientIP(req);
+                this.logger.warn(
+                    `[Auth] Access password incorrect or missing, request denied. IP: ${clientIp}, Path: ${req.path}`
+                );
+            }
+
+            return res.status(401).json({
+                error: {
+                    message: "Access denied. A valid API key was not found or is incorrect.",
+                },
+            });
+        };
+    }
+
+    async _startHttpServer() {
+        const app = this._createExpressApp();
+
+        if (this.config.sslKeyPath && this.config.sslCertPath) {
+            try {
+                if (fs.existsSync(this.config.sslKeyPath) && fs.existsSync(this.config.sslCertPath)) {
+                    const options = {
+                        cert: fs.readFileSync(this.config.sslCertPath),
+                        key: fs.readFileSync(this.config.sslKeyPath),
+                    };
+                    this.httpServer = https.createServer(options, app);
+                    this.logger.info("[System] Starting in HTTPS mode...");
+                } else {
+                    this.logger.warn("[System] SSL file paths provided but files not found. Falling back to HTTP.");
+                    this.httpServer = http.createServer(app);
+                }
+            } catch (error) {
+                this.logger.error(`[System] Failed to load SSL files: ${error.message}. Falling back to HTTP.`);
+                this.httpServer = http.createServer(app);
+            }
+        } else {
+            this.httpServer = http.createServer(app);
+        }
+
+        this.httpServer.on("upgrade", (req, socket) => {
+            const pathname = new URL(req.url, `http://${req.headers.host}`).pathname;
+
+            if (pathname === "/vnc") {
+                this.logger.info("[VNC Proxy] Detected VNC WebSocket upgrade request. Verifying session...");
+
+                // Use the session parser from WebRoutes to verify authentication
+                this.webRoutes.sessionParser(req, {}, () => {
+                    if (!req.session || !req.session.isAuthenticated) {
+                        const clientIp = this.webRoutes.authRoutes.getClientIP(req);
+                        this.logger.warn(`[VNC Proxy] Unauthorized WebSocket connection attempt from ${clientIp}`);
+                        socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+                        socket.destroy();
+                        return;
+                    }
+
+                    this.logger.info("[VNC Proxy] Session verified. Proxying...");
+                    const target = net.createConnection({ host: "localhost", port: 6080 });
+
+                    target.on("connect", () => {
+                        this.logger.info("[VNC Proxy] Successfully connected to internal websockify (port 6080).");
+
+                        // Forward the WebSocket handshake headers to the backend
+                        const headers = [
+                            `GET ${req.url} HTTP/1.1`,
+                            "Host: localhost:6080",
+                            "Upgrade: websocket",
+                            "Connection: Upgrade",
+                            `Sec-WebSocket-Key: ${req.headers["sec-websocket-key"]}`,
+                            `Sec-WebSocket-Version: ${req.headers["sec-websocket-version"]}`,
+                        ];
+
+                        if (req.headers["sec-websocket-protocol"]) {
+                            headers.push(`Sec-WebSocket-Protocol: ${req.headers["sec-websocket-protocol"]}`);
+                        }
+
+                        if (req.headers["sec-websocket-extensions"]) {
+                            headers.push(`Sec-WebSocket-Extensions: ${req.headers["sec-websocket-extensions"]}`);
+                        }
+
+                        // Write the handshake to the backend
+                        target.write(headers.join("\r\n") + "\r\n\r\n");
+
+                        // Pipe the sockets together. The backend will respond with 101, which goes to the client.
+                        target.pipe(socket).pipe(target);
+                    });
+
+                    target.on("error", err => {
+                        this.logger.error(`[VNC Proxy] Error connecting to internal websockify: ${err.message}`);
+                        socket.destroy();
+                    });
+
+                    socket.on("error", err => {
+                        this.logger.error(`[VNC Proxy] Client socket error: ${err.message}`);
+                        target.destroy();
+                    });
+                });
+            } else {
+                // If it's not for VNC, destroy the socket to prevent hanging connections
+                this.logger.warn(
+                    `[System] Received an upgrade request for an unknown path: ${pathname}. Connection terminated.`
+                );
+                socket.destroy();
+            }
+        });
+
+        this.httpServer.keepAliveTimeout = 120000;
+        this.httpServer.headersTimeout = 125000;
+        this.httpServer.requestTimeout = 120000;
+
+        return new Promise(resolve => {
+            this.httpServer.listen(this.config.httpPort, this.config.host, () => {
+                this.logger.info(
+                    `[System] HTTP server is listening on http://${this.config.host}:${this.config.httpPort}`
+                );
+                this.logger.info(
+                    `[System] Keep-Alive timeout set to ${this.httpServer.keepAliveTimeout / 1000} seconds.`
+                );
+                resolve();
+            });
+        });
+    }
+
+    _createExpressApp() {
+        const app = express();
+
+        // Request logging
+        app.use((req, res, next) => {
+            if (
+                req.path !== "/api/status" &&
+                req.path !== "/api/usage-stats" &&
+                req.path !== "/" &&
+                req.path !== "/favicon.ico" &&
+                req.path !== "/login" &&
+                req.path !== "/health" &&
+                !req.path.startsWith("/locales/") &&
+                !req.path.startsWith("/assets/") &&
+                req.path !== "/AIStudio_logo.svg" &&
+                req.path !== "/AIStudio_icon.svg" &&
+                req.path !== "/AIStudio_logo_dark.svg"
+            ) {
+                this.logger.info(`[Entrypoint] Received a request: ${req.method} ${req.path}`);
+            }
+            next();
+        });
+
+        // CORS middleware
+        app.use((req, res, next) => {
+            res.header("Access-Control-Allow-Origin", "*");
+            res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS");
+            res.header("Access-Control-Allow-Private-Network", "true");
+            res.header(
+                "Access-Control-Allow-Headers",
+                "Content-Type, Authorization, x-requested-with, x-api-key, x-goog-api-key, x-goog-api-client, x-user-agent," +
+                    " origin, accept, baggage, sentry-trace, openai-organization, openai-project, openai-beta, x-stainless-lang, " +
+                    "x-stainless-package-version, x-stainless-os, x-stainless-arch, x-stainless-runtime, x-stainless-runtime-version, " +
+                    "x-stainless-retry-count, x-stainless-timeout, sec-ch-ua, sec-ch-ua-mobile, sec-ch-ua-platform, " +
+                    "anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access, " +
+                    "x-goog-upload-protocol, x-goog-upload-command, x-goog-upload-header-content-length, " +
+                    "x-goog-upload-header-content-type, x-goog-upload-url, x-goog-upload-offset, x-goog-upload-status"
+            );
+
+            // Expose all common Headers, including upload related ones (matched from BuildProxy)
+            res.header("Access-Control-Expose-Headers", "*");
+            res.header(
+                "Access-Control-Expose-Headers",
+                "x-goog-upload-url, x-goog-upload-status, x-goog-upload-chunk-granularity, " +
+                    "x-goog-upload-control-url, x-goog-upload-command, x-goog-upload-content-type, " +
+                    "x-goog-upload-protocol, x-goog-upload-file-name, x-goog-upload-offset, " +
+                    "date, content-type, content-length, location"
+            );
+
+            if (req.method === "OPTIONS") {
+                return res.sendStatus(204);
+            }
+            next();
+        });
+
+        // Manual body collection middleware (BuildProxy style)
+        // Collects the entire raw body into req.rawBody as a Buffer
+        // Also attempts to parse JSON into req.body for compatibility
+        app.use((req, res, next) => {
+            if (req.method === "GET" || req.method === "OPTIONS" || req.method === "HEAD") {
+                return next();
+            }
+
+            const chunks = [];
+            req.on("data", chunk => chunks.push(chunk));
+            req.on("end", () => {
+                req.rawBody = Buffer.concat(chunks);
+
+                // Try to parse JSON for req.body compatibility
+                if (req.headers["content-type"]?.includes("application/json")) {
+                    try {
+                        req.body = JSON.parse(req.rawBody.toString());
+                    } catch (e) {
+                        // Not valid JSON, keep req.body undefined or empty
+                        req.body = {};
+                    }
+                } else if (req.headers["content-type"]?.includes("application/x-www-form-urlencoded")) {
+                    try {
+                        const qs = require("querystring");
+                        req.body = qs.parse(req.rawBody.toString());
+                    } catch (e) {
+                        req.body = {};
+                    }
+                } else {
+                    req.body = {};
+                }
+
+                next();
+            });
+
+            req.on("error", err => {
+                this.logger.error(`[System] Request stream error: ${err.message}`);
+                next(err);
+            });
+        });
+
+        // Serve static files from ui/dist (Vite build output)
+        app.use(express.static(path.join(__dirname, "..", "..", "ui", "dist")));
+
+        // Serve additional public assets under ui/public
+        app.use(express.static(path.join(__dirname, "..", "..", "ui", "public")));
+
+        // Serve locales for front-end only translations
+        app.use("/locales", express.static(path.join(__dirname, "..", "..", "ui", "locales")));
+
+        // Setup session and all routes (auth, status, and auth creation)
+        this.webRoutes.setupSession(app);
+
+        // API authentication middleware
+        app.use(this._createAuthMiddleware());
+
+        // API routes
+        app.get(["/v1/models"], (req, res) => {
+            // OpenAI format
+            const models = this.config.modelList.map(model => ({
+                context_window: model.inputTokenLimit,
+                created: Math.floor(Date.now() / 1000),
+                id: model.name.replace("models/", ""),
+                max_tokens: model.outputTokenLimit,
+                object: "model",
+                owned_by: "google",
+            }));
+
+            res.status(200).json({
+                data: models,
+                object: "list",
+            });
+        });
+
+        app.get(["/v1beta/models"], (req, res) => {
+            res.status(200).json({ models: this.config.modelList });
+        });
+
+        app.post("/v1/chat/completions", (req, res) => {
+            this.requestHandler.processOpenAIRequest(req, res);
+        });
+
+        app.post(["/v1/embeddings", "/v1/openai/embeddings"], (req, res) => {
+            this.requestHandler.processOpenAIEmbeddingsRequest(req, res);
+        });
+
+        // OpenAI Response API compatible endpoint
+        app.post("/v1/responses", (req, res) => {
+            this.requestHandler.processOpenAIResponseRequest(req, res);
+        });
+
+        // OpenAI Response API count input tokens endpoint
+        app.post(["/v1/responses/input_tokens", "/responses/input_tokens"], (req, res) => {
+            this.requestHandler.processOpenAIResponseInputTokens(req, res);
+        });
+
+        // Claude API compatible endpoint
+        app.post("/v1/messages", (req, res) => {
+            this.requestHandler.processClaudeRequest(req, res);
+        });
+
+        // Claude API count tokens endpoint
+        app.post("/v1/messages/count_tokens", (req, res) => {
+            this.requestHandler.processClaudeCountTokens(req, res);
+        });
+
+        // VNC WebSocket downgrade / missing headers handler
+        // If Nginx or another proxy strips "Upgrade: websocket" headers, the request appears as a normal GET.
+        // We intercept it here to prevent it from falling through to the Gemini proxy.
+        app.get("/vnc", (req, res) => {
+            res.status(400).send(
+                "Error: WebSocket connection failed. " +
+                    "If you are using a proxy (like Nginx), ensure it is configured to forward 'Upgrade' and 'Connection' headers."
+            );
+        });
+
+        // File Upload Routes
+        // Intercept upload requests to use specialized handler
+        app.all(/\/upload\/.*/, (req, res) => {
+            this.requestHandler.processUploadRequest(req, res);
+        });
+
+        app.all(/(.*)/, (req, res) => {
+            this.requestHandler.processRequest(req, res);
+        });
+
+        return app;
+    }
+
+    async _startWebSocketServer() {
+        return new Promise((resolve, reject) => {
+            let isListening = false;
+
+            this.wsServer = new WebSocket.Server({
+                host: this.config.host,
+                port: this.config.wsPort,
+            });
+
+            this.wsServer.once("listening", () => {
+                isListening = true;
+                this.logger.info(
+                    `[System] WebSocket server is listening on ws://${this.config.host}:${this.config.wsPort}`
+                );
+                resolve();
+            });
+
+            this.wsServer.on("error", err => {
+                if (!isListening) {
+                    this.logger.error(`[System] WebSocket server failed to start: ${err.message}`);
+                    reject(err);
+                } else {
+                    this.logger.error(`[System] WebSocket server runtime error: ${err.message}`);
+                }
+            });
+            this.wsServer.on("connection", (ws, req) => {
+                // Parse authIndex from query parameter
+                const url = new URL(req.url, `http://${req.headers.host}`);
+                const authIndexParam = url.searchParams.get("authIndex");
+                const authIndex = authIndexParam !== null ? parseInt(authIndexParam, 10) : -1;
+
+                // Validate authIndex: must be a valid non-negative integer
+                if (Number.isNaN(authIndex) || authIndex < 0) {
+                    this.logger.error(
+                        `[System] Rejecting WebSocket connection with invalid authIndex: ${authIndexParam} (parsed as ${authIndex})`
+                    );
+                    this._safeCloseWebSocket(ws, 1008, "Invalid authIndex: must be a non-negative integer");
+                    return;
+                }
+
+                this.connectionRegistry.addConnection(ws, {
+                    address: req.socket.remoteAddress,
+                    authIndex,
+                });
+            });
+        });
+    }
+
+    /**
+     * Safely close a WebSocket connection with readyState check
+     * @param {WebSocket} ws - The WebSocket to close
+     * @param {number} code - Close code (e.g., 1000, 1008)
+     * @param {string} reason - Close reason
+     */
+    _safeCloseWebSocket(ws, code, reason) {
+        if (!ws) {
+            return;
+        }
+
+        // WebSocket readyState: 0=CONNECTING, 1=OPEN, 2=CLOSING, 3=CLOSED
+        // Only attempt to close if not already closing or closed
+        if (ws.readyState === 0 || ws.readyState === 1) {
+            try {
+                ws.close(code, reason);
+            } catch (error) {
+                this.logger.warn(
+                    `[System] Failed to close WebSocket (code=${code}, reason="${reason}"): ${error.message}`
+                );
+            }
+        } else {
+            this.logger.debug(
+                `[System] WebSocket already closing/closed (readyState=${ws.readyState}), skipping close()`
+            );
+        }
+    }
+
+    /**
+     * Gracefully shutdown the server system
+     */
+    async shutdown() {
+        this.logger.info("[System] Shutting down server system...");
+
+        // Clear stale queue cleanup interval
+        if (this.staleQueueCleanupInterval) {
+            clearInterval(this.staleQueueCleanupInterval);
+            this.staleQueueCleanupInterval = null;
+            this.logger.info("[System] Stopped stale queue cleanup interval");
+        }
+
+        // Close all message queues
+        if (this.connectionRegistry) {
+            this.connectionRegistry.closeAllMessageQueues();
+        }
+
+        // Close browser
+        if (this.browserManager) {
+            await this.browserManager.closeBrowser();
+        }
+
+        // Close servers and wait for them to finish closing
+        const closeServer = (server, name) =>
+            new Promise(resolve => {
+                if (!server) {
+                    return resolve();
+                }
+
+                try {
+                    server.close(() => {
+                        this.logger.info(`[System] ${name} closed`);
+                        resolve();
+                    });
+                } catch (error) {
+                    this.logger.warn(`[System] Error while closing ${name}: ${error.message}`);
+                    resolve();
+                }
+            });
+
+        await Promise.all([
+            closeServer(this.wsServer, "WebSocket server"),
+            closeServer(this.httpServer, "HTTP server"),
+        ]);
+        this.logger.info("[System] Shutdown complete");
+    }
+}
+
+module.exports = ProxyServerSystem;

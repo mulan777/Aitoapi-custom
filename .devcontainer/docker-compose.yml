@@ -1,0 +1,36 @@
+version: "3.8"
+
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        - CAMOUFOX_URL=${CAMOUFOX_URL:-}
+
+    volumes:
+      - ..:/workspace:cached
+      - node_modules:/workspace/node_modules
+
+    network_mode: bridge
+    ports:
+      - "7860:7860"
+      - "5173:5173"
+
+    # 保持容器运行（覆盖生产环境的 CMD）
+    command: sleep infinity
+
+    # 环境变量
+    environment:
+      - NODE_ENV=development
+      - CAMOUFOX_EXECUTABLE_PATH=/app/camoufox-linux/camoufox
+
+    # 安全选项（开发环境需要）
+    security_opt:
+      - seccomp=unconfined
+
+    # 共享内存大小
+    shm_size: "2gb"
+
+volumes:
+  node_modules:

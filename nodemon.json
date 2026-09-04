@@ -1,0 +1,7 @@
+{
+    "watch": ["main.js", "src/**/*.js", "configs/models.json", ".env"],
+    "ignore": ["node_modules/**", "configs/auth/**", "camoufox/**", "*.log"],
+    "ext": "js,json",
+    "delay": 500,
+    "verbose": true
+}

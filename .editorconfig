@@ -1,0 +1,59 @@
+# EditorConfig is awesome: https://EditorConfig.org
+
+# top-most EditorConfig file
+root = true
+
+# Unix-style newlines with a newline ending every file
+[*]
+end_of_line = lf
+insert_final_newline = true
+charset = utf-8
+trim_trailing_whitespace = true
+
+# Backend JavaScript files (Node.js server code)
+[{src/**/*.js,main.js,scripts/**/*.js}]
+indent_style = space
+indent_size = 4
+quote_type = double
+
+# Frontend JavaScript files (browser code)
+[{ui/**/*.js}]
+indent_style = space
+indent_size = 4
+quote_type = single
+
+# Vue files
+[ui/**/*.vue]
+indent_style = space
+indent_size = 4
+
+# HTML files
+[ui/**/*.html]
+indent_style = space
+indent_size = 4
+quote_type = double
+
+# CSS files
+[ui/**/*.css]
+indent_style = space
+indent_size = 4
+quote_type = single
+
+# JSON files
+[*.json]
+indent_style = space
+indent_size = 2
+
+# JSON files in locales and configs directories - use 4 spaces
+[{ui/locales/*.json,configs/models.json}]
+indent_style = space
+indent_size = 4
+
+# Markdown files
+[*.md]
+trim_trailing_whitespace = false
+
+# YAML files
+[*.{yml,yaml}]
+indent_style = space
+indent_size = 2

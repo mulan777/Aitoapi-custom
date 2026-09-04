@@ -1,0 +1,44 @@
+/**
+ * File: global.less
+ * Description: Global styles that apply to all pages
+ *
+ * Author: iBenzene, bbbugg
+ */
+
+@import "variables.less";
+
+// Reset and base styles
+*,
+*::before,
+*::after {
+    box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+    align-items: center;
+    background: @background-light;
+    color: @text-primary;
+    font-family: @font-family-sans;
+    height: 100%;
+    margin: 0;
+    overflow: visible;
+}
+
+// Vue cloak directive
+[v-cloak] {
+    display: none;
+}
+
+// Root app container
+#app {
+    display: contents;
+}
+
+// Smooth scrolling、
+@media (prefers-reduced-motion: no-preference) {
+    html {
+        scroll-behavior: smooth;
+    }
+}

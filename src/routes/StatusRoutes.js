@@ -1,0 +1,1041 @@
+/**
+ * File: src/routes/StatusRoutes.js
+ * Description: Status and system management routes
+ *
+ * Author: Ellinav, iBenzene, bbbugg
+ */
+
+const fs = require("fs");
+const path = require("path");
+const archiver = require("archiver");
+const VersionChecker = require("../utils/VersionChecker");
+const LoggingService = require("../utils/LoggingService");
+const UsageStatsService = require("../core/UsageStatsService");
+
+/**
+ * Status Routes Manager
+ * Manages system status, account management, and settings routes
+ */
+class StatusRoutes {
+    constructor(serverSystem) {
+        this.serverSystem = serverSystem;
+        this.logger = serverSystem.logger;
+        this.config = serverSystem.config;
+        this.distIndexPath = serverSystem.distIndexPath;
+        this.versionChecker = new VersionChecker(this.logger);
+        this.allowedSafetyThresholds = new Set([
+            "HARM_BLOCK_THRESHOLD_UNSPECIFIED",
+            "BLOCK_LOW_AND_ABOVE",
+            "BLOCK_MEDIUM_AND_ABOVE",
+            "BLOCK_ONLY_HIGH",
+            "BLOCK_NONE",
+            "OFF",
+        ]);
+    }
+
+    _rejectIfSystemBusy(res) {
+        if (!this.serverSystem.requestHandler?.isSystemBusy) {
+            return false;
+        }
+
+        return res.status(409).json({
+            error: "System is busy switching or recovering accounts. Please try again later.",
+            message: "systemBusySwitchingOrRecoveringAccounts",
+        });
+    }
+
+    /**
+     * Setup status and management routes
+     */
+    setupRoutes(app, isAuthenticated) {
+        // Favicon endpoint (public, no authentication required)
+        app.get("/favicon.ico", (req, res) => {
+            const iconUrl = process.env.ICON_URL || "/AIStudio_logo.svg";
+
+            // Redirect to the configured icon URL (default: local SVG icon)
+            // This supports any icon format (ICO, PNG, SVG, etc.) and any size
+            res.redirect(302, iconUrl);
+        });
+
+        // Health check endpoint (public, no authentication required)
+        app.get("/health", (req, res) => {
+            const now = new Date();
+            const timezone = process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
+            let timestamp;
+
+            try {
+                timestamp =
+                    now
+                        .toLocaleString("zh-CN", {
+                            day: "2-digit",
+                            hour: "2-digit",
+                            hour12: false,
+                            minute: "2-digit",
+                            month: "2-digit",
+                            second: "2-digit",
+                            timeZone: timezone,
+                            year: "numeric",
+                        })
+                        .replace(/\//g, "-") + `.${now.getMilliseconds().toString().padStart(3, "0")} [${timezone}]`;
+            } catch (err) {
+                timestamp = now.toISOString();
+            }
+
+            const healthStatus = {
+                browserConnected: !!this.serverSystem.browserManager.browser,
+                status: "ok",
+                timestamp,
+                uptime: process.uptime(),
+            };
+            res.status(200).json(healthStatus);
+        });
+
+        app.get("/", isAuthenticated, (req, res) => {
+            res.status(200).sendFile(this.distIndexPath);
+        });
+
+        app.post("/", (req, res) => {
+            res.status(405).json({ error: "Method Not Allowed" });
+        });
+
+        app.get("/auth", isAuthenticated, (req, res) => {
+            res.sendFile(this.distIndexPath);
+        });
+
+        // Version check endpoint - separate from status to avoid frequent calls
+        app.get("/api/version/check", isAuthenticated, async (req, res) => {
+            // Check if update checking is disabled via environment variable
+            const checkUpdate = this.config.checkUpdate !== false;
+            if (!checkUpdate) {
+                return res.status(200).json({
+                    current: this.versionChecker.getCurrentVersion(),
+                    disabled: true,
+                    hasUpdate: false,
+                    latest: null,
+                    releaseUrl: null,
+                });
+            }
+
+            try {
+                const result = await this.versionChecker.checkForUpdates();
+                res.status(200).json(result);
+            } catch (error) {
+                this.logger.error(`[VersionCheck] Error: ${error.message}`);
+                res.status(500).json({ error: "Failed to check for updates" });
+            }
+        });
+
+        app.get("/api/status", isAuthenticated, async (req, res) => {
+            // Force a reload of auth sources on each status check for real-time accuracy
+            const hasChanges = this.serverSystem.authSource.reloadAuthSources();
+
+            const { authSource, browserManager, requestHandler } = this.serverSystem;
+
+            // If the system is busy switching accounts, skip the validity check to prevent race conditions
+            if (requestHandler.isSystemBusy) {
+                // Rebalance context pool if auth files changed
+                if (hasChanges) {
+                    this.serverSystem.browserManager.rebalanceContextPool().catch(err => {
+                        this.logger.error(`[System] Background rebalance failed: ${err.message}`);
+                    });
+                }
+                return res.json(this._getStatusData());
+            }
+
+            // After reloading, only check for auth validity if a browser is active and has a valid current account.
+            const currentAuthIndex = requestHandler.currentAuthIndex;
+            if (browserManager.browser && currentAuthIndex >= 0) {
+                if (!authSource.availableIndices.includes(currentAuthIndex)) {
+                    this.logger.warn(
+                        `[System] Current auth index #${currentAuthIndex} is no longer valid after reload (e.g., file deleted).`
+                    );
+                    this.logger.warn("[System] Closing context for invalid auth.");
+                    try {
+                        // Terminate pending requests for this account before closing
+                        this.serverSystem.connectionRegistry.closeMessageQueuesForAuth(
+                            currentAuthIndex,
+                            "invalid_auth"
+                        );
+                        // Close context (this will trigger WebSocket disconnect)
+                        await browserManager.closeContext(currentAuthIndex);
+                        // Close WebSocket connection explicitly
+                        this.serverSystem.connectionRegistry.closeConnectionByAuth(currentAuthIndex);
+                    } catch (err) {
+                        this.logger.error(`[System] Error while closing context automatically: ${err.message}`);
+                    }
+                }
+            }
+
+            // Rebalance context pool if auth files changed (e.g., user manually added/removed files)
+            if (hasChanges) {
+                this.logger.info("[System] Auth file changes detected, rebalancing context pool...");
+                this.serverSystem.browserManager.rebalanceContextPool().catch(err => {
+                    this.logger.error(`[System] Background rebalance failed: ${err.message}`);
+                });
+            }
+
+            res.json(this._getStatusData());
+        });
+
+        app.get("/api/usage-stats", isAuthenticated, (req, res) => {
+            const snapshot = this.serverSystem.usageStatsService?.getSnapshot();
+            res.json(snapshot || UsageStatsService.createEmptySnapshot());
+        });
+
+        app.get("/api/usage-stats/download", isAuthenticated, async (req, res) => {
+            try {
+                const usageStatsService = this.serverSystem.usageStatsService;
+                if (!usageStatsService?.enabled) {
+                    return res.status(403).json({ message: "usageStatsDisabled" });
+                }
+                if (usageStatsService.isImportingStats) {
+                    return res.status(409).json({ message: "usageStatsImportInProgress" });
+                }
+                const statsFilePath =
+                    usageStatsService?.statsFilePath || path.join(process.cwd(), "data", "usage-stats.jsonl");
+
+                if (usageStatsService?.appendPromise) {
+                    await usageStatsService.appendPromise.catch(() => {});
+                }
+
+                if (!fs.existsSync(statsFilePath)) {
+                    return res.status(404).json({ message: "usageStatsDownloadNoData" });
+                }
+
+                if (req.query.check === "1") {
+                    return res.json({ ok: true });
+                }
+
+                res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
+                res.sendFile(statsFilePath);
+            } catch (error) {
+                this.logger.error(`[WebUI] Failed to download usage stats: ${error.message}`);
+                res.status(500).json({ error: error.message, message: "usageStatsDownloadFailed" });
+            }
+        });
+
+        app.post("/api/usage-stats/import", isAuthenticated, async (req, res) => {
+            try {
+                const usageStatsService = this.serverSystem.usageStatsService;
+                if (!usageStatsService?.enabled) {
+                    return res.status(403).json({ message: "usageStatsDisabled" });
+                }
+                if (usageStatsService.isImportingStats) {
+                    return res.status(409).json({ message: "usageStatsImportInProgress" });
+                }
+
+                const { content, filename } = req.body || {};
+                if (typeof filename !== "string" || !filename.toLowerCase().endsWith(".jsonl")) {
+                    return res.status(400).json({ message: "usageStatsImportJsonlOnly" });
+                }
+                if (typeof content !== "string") {
+                    return res.status(400).json({ message: "usageStatsImportInvalidFile" });
+                }
+
+                const result = await usageStatsService.importJsonl(content);
+                res.json({
+                    duplicateCount: result.duplicateCount,
+                    importedCount: result.importedCount,
+                    invalidLineCount: result.invalidLineCount,
+                    message: "usageStatsImportSuccess",
+                    missingRequestIdCount: result.missingRequestIdCount,
+                    totalRecords: result.totalRecords,
+                });
+            } catch (error) {
+                this.logger.error(`[WebUI] Failed to import usage stats: ${error.message}`);
+                res.status(500).json({ error: error.message, message: "usageStatsImportFailed" });
+            }
+        });
+
+        app.put("/api/accounts/current", isAuthenticated, async (req, res) => {
+            try {
+                if (this._rejectIfSystemBusy(res)) return;
+
+                const { targetIndex } = req.body;
+                if (targetIndex !== undefined && targetIndex !== null) {
+                    this.logger.info(`[WebUI] Received request to switch to specific account #${targetIndex}...`);
+                    const result = await this.serverSystem.requestHandler._switchToSpecificAuth(targetIndex);
+                    if (result.success) {
+                        res.status(200).json({ message: "accountSwitchSuccess", newIndex: result.newIndex });
+                    } else {
+                        res.status(400).json({ message: "accountSwitchFailed", reason: result.reason });
+                    }
+                } else {
+                    this.logger.info("[WebUI] Received manual request to switch to next account...");
+                    if (this.serverSystem.authSource.getRotationIndices().length <= 1) {
+                        return res.status(400).json({ message: "accountSwitchCancelledSingle" });
+                    }
+                    const result = await this.serverSystem.requestHandler._switchToNextAuth();
+                    if (result.success) {
+                        res.status(200).json({ message: "accountSwitchSuccessNext", newIndex: result.newIndex });
+                    } else if (result.fallback) {
+                        res.status(200).json({ message: "accountSwitchFallback", newIndex: result.newIndex });
+                    } else {
+                        res.status(409).json({ message: "accountSwitchSkipped", reason: result.reason });
+                    }
+                }
+            } catch (error) {
+                res.status(500).json({ error: error.message, message: "accountSwitchFatal" });
+            }
+        });
+
+        app.post("/api/accounts/deduplicate", isAuthenticated, async (req, res) => {
+            try {
+                if (this._rejectIfSystemBusy(res)) return;
+
+                const { authSource, requestHandler } = this.serverSystem;
+
+                const duplicateGroups = authSource.getDuplicateGroups() || [];
+                if (duplicateGroups.length === 0) {
+                    return res.status(200).json({
+                        message: "accountDedupNoop",
+                        removedIndices: [],
+                    });
+                }
+
+                this.logger.warn(
+                    "[Auth] Dedup cleanup will keep the auth file with the highest index per email and delete the other duplicates. " +
+                        "Assumption: for the same account, auth indices are created in chronological order (higher index = newer)."
+                );
+
+                const currentAuthIndex = requestHandler.currentAuthIndex;
+                if (Number.isInteger(currentAuthIndex) && currentAuthIndex >= 0) {
+                    const canonicalCurrent = authSource.getCanonicalIndex(currentAuthIndex);
+                    if (canonicalCurrent !== null && canonicalCurrent !== currentAuthIndex) {
+                        this.logger.warn(
+                            `[Auth] Current active auth #${currentAuthIndex} is a duplicate. Switching to the latest auth #${canonicalCurrent} before cleanup.`
+                        );
+                        const switchResult = await requestHandler._switchToSpecificAuth(canonicalCurrent);
+                        if (!switchResult.success) {
+                            return res.status(409).json({
+                                message: "accountDedupSwitchFailed",
+                                reason: switchResult.reason,
+                            });
+                        }
+                    }
+                }
+
+                const removedIndices = [];
+                const failed = [];
+
+                // Abort any ongoing background preload task before deletion
+                // This prevents race conditions where background tasks continue initializing contexts
+                // that are about to be deleted
+                await this.serverSystem.browserManager.abortBackgroundPreload();
+
+                // Delete duplicate auth files
+                for (const group of duplicateGroups) {
+                    const removed = Array.isArray(group.removedIndices) ? group.removedIndices : [];
+                    if (removed.length === 0) continue;
+
+                    this.logger.info(
+                        `[Auth] Dedup: email ${group.email} -> keep auth-${group.keptIndex}.json, delete [${removed
+                            .map(i => `auth-${i}.json`)
+                            .join(", ")}]`
+                    );
+
+                    for (const index of removed) {
+                        try {
+                            authSource.removeAuth(index);
+                            removedIndices.push(index);
+                        } catch (error) {
+                            failed.push({ error: error.message, index });
+                            this.logger.error(`[Auth] Dedup delete failed for auth-${index}.json: ${error.message}`);
+                        }
+                    }
+                }
+
+                if (failed.length > 0) {
+                    return res.status(500).json({
+                        failed,
+                        message: "accountDedupPartialFailed",
+                        removedIndices,
+                    });
+                }
+
+                // Reload auth sources to update internal state immediately after dedup deletions
+                if (removedIndices.length > 0) {
+                    authSource.reloadAuthSources();
+                }
+
+                // Close contexts for removed duplicate accounts
+                if (removedIndices.length > 0) {
+                    for (const idx of removedIndices) {
+                        try {
+                            await this.serverSystem.browserManager.closeContext(idx);
+                            this.serverSystem.connectionRegistry.closeConnectionByAuth(idx);
+                        } catch (error) {
+                            this.logger.warn(
+                                `[Auth] Failed to close context for removed duplicate #${idx}: ${error.message}`
+                            );
+                        }
+                    }
+                }
+
+                // Rebalance context pool after dedup
+                if (removedIndices.length > 0) {
+                    this.serverSystem.browserManager.rebalanceContextPool().catch(err => {
+                        this.logger.error(`[Auth] Background rebalance failed: ${err.message}`);
+                    });
+                }
+
+                return res.status(200).json({
+                    message: "accountDedupSuccess",
+                    removedIndices,
+                });
+            } catch (error) {
+                this.logger.error(`[Auth] Dedup cleanup failed: ${error.message}`);
+                return res.status(500).json({ error: error.message, message: "accountDedupFailed" });
+            }
+        });
+
+        // Batch delete accounts - Must be defined before /api/accounts/:index to avoid index matching "batch"
+        app.delete("/api/accounts/batch", isAuthenticated, async (req, res) => {
+            if (this._rejectIfSystemBusy(res)) return;
+
+            const { indices, force } = req.body;
+            const currentAuthIndex = this.serverSystem.requestHandler.currentAuthIndex;
+
+            // Validate parameters
+            if (!Array.isArray(indices) || indices.length === 0) {
+                return res.status(400).json({ message: "errorInvalidIndex" });
+            }
+
+            const { authSource } = this.serverSystem;
+            const uniqueIndices = Array.from(new Set(indices));
+            const validIndices = uniqueIndices.filter(
+                idx => Number.isInteger(idx) && authSource.initialIndices.includes(idx)
+            );
+
+            const invalidIndices = uniqueIndices.filter(
+                idx => !Number.isInteger(idx) || !authSource.initialIndices.includes(idx)
+            );
+
+            if (validIndices.length === 0) {
+                return res.status(404).json({
+                    indices: invalidIndices.join(", "),
+                    message: "errorAccountsNotFound",
+                });
+            }
+
+            const successIndices = [];
+            const failedIndices = [];
+
+            // Add invalid indices to failed list immediately
+            for (const idx of invalidIndices) {
+                failedIndices.push({
+                    error: "Account not found or invalid",
+                    index: idx,
+                });
+            }
+
+            // Check if current active account is included in VALID indices
+            const includesCurrent = validIndices.includes(currentAuthIndex);
+            if (includesCurrent && !force) {
+                return res.status(409).json({
+                    includesCurrent: true,
+                    message: "warningDeleteCurrentAccount",
+                    requiresConfirmation: true,
+                });
+            }
+
+            // Abort any ongoing background preload task before deletion
+            // This prevents race conditions where background tasks continue initializing contexts
+            // that are about to be deleted
+            await this.serverSystem.browserManager.abortBackgroundPreload();
+
+            // Delete auth files
+            for (const targetIndex of validIndices) {
+                try {
+                    authSource.removeAuth(targetIndex);
+                    successIndices.push(targetIndex);
+                    this.logger.warn(`[WebUI] Account #${targetIndex} deleted via batch delete.`);
+                } catch (error) {
+                    failedIndices.push({ error: error.message, index: targetIndex });
+                    this.logger.error(`[WebUI] Failed to delete account #${targetIndex}: ${error.message}`);
+                }
+            }
+
+            // Reload auth sources to update internal state immediately after deletions
+            if (successIndices.length > 0) {
+                authSource.reloadAuthSources();
+            }
+
+            // If current active account was deleted, close context first, then connection
+            if (includesCurrent && successIndices.includes(currentAuthIndex)) {
+                this.logger.warn(
+                    `[WebUI] Current active account #${currentAuthIndex} was deleted. Closing context and connection...`
+                );
+                // Set system busy flag to prevent new requests during cleanup
+                const previousBusy = this.serverSystem.requestHandler.isSystemBusy === true;
+                if (!previousBusy) {
+                    this.serverSystem.requestHandler.isSystemBusy = true;
+                }
+                try {
+                    // 1. Terminate pending requests for the current account
+                    this.serverSystem.connectionRegistry.closeMessageQueuesForAuth(
+                        currentAuthIndex,
+                        "account_deleted_current"
+                    );
+                    // 2. Close context first so page is gone when _removeConnection checks
+                    await this.serverSystem.browserManager.closeContext(currentAuthIndex);
+                    // 3. Then close WebSocket connection
+                    this.serverSystem.connectionRegistry.closeConnectionByAuth(currentAuthIndex);
+                } finally {
+                    // Reset system busy flag after cleanup completes
+                    if (!previousBusy) {
+                        this.serverSystem.requestHandler.isSystemBusy = false;
+                    }
+                }
+            }
+
+            // Close contexts and connections for all successfully deleted accounts (except current, already handled)
+            for (const idx of successIndices) {
+                if (idx !== currentAuthIndex) {
+                    this.logger.info(`[WebUI] Closing context and connection for deleted account #${idx}...`);
+                    // Close context first so page is gone when _removeConnection checks
+                    await this.serverSystem.browserManager.closeContext(idx);
+                    // Then close WebSocket connection
+                    this.serverSystem.connectionRegistry.closeConnectionByAuth(idx);
+                }
+            }
+
+            // Rebalance context pool after batch delete
+            if (successIndices.length > 0) {
+                this.serverSystem.browserManager.rebalanceContextPool().catch(err => {
+                    this.logger.error(`[Auth] Background rebalance failed: ${err.message}`);
+                });
+            }
+
+            if (failedIndices.length > 0) {
+                return res.status(207).json({
+                    failedIndices,
+                    message: "batchDeletePartial",
+                    successCount: successIndices.length,
+                    successIndices,
+                });
+            }
+
+            return res.status(200).json({
+                message: "batchDeleteSuccess",
+                successCount: successIndices.length,
+                successIndices,
+            });
+        });
+
+        // Batch download accounts as ZIP
+        app.post("/api/accounts/batch/download", isAuthenticated, async (req, res) => {
+            const { indices } = req.body;
+
+            // Validate parameters
+            if (!Array.isArray(indices) || indices.length === 0) {
+                return res.status(400).json({ message: "errorInvalidIndex" });
+            }
+
+            const { authSource } = this.serverSystem;
+            const uniqueIndices = Array.from(new Set(indices));
+
+            const invalidIndices = uniqueIndices.filter(
+                idx => !Number.isInteger(idx) || !authSource.initialIndices.includes(idx)
+            );
+
+            const validIndices = uniqueIndices.filter(
+                idx => Number.isInteger(idx) && authSource.initialIndices.includes(idx)
+            );
+
+            if (validIndices.length === 0) {
+                return res.status(404).json({
+                    indices: invalidIndices.join(", "),
+                    message: "errorAccountsNotFound",
+                });
+            }
+
+            const configDir = path.join(process.cwd(), "configs", "auth");
+
+            try {
+                // Pre-calculate valid files to archive
+                const filesToArchive = [];
+                for (const idx of validIndices) {
+                    const filePath = path.join(configDir, `auth-${idx}.json`);
+                    if (fs.existsSync(filePath)) {
+                        filesToArchive.push({ filePath, name: `auth-${idx}.json` });
+                    }
+                }
+
+                const actualFileCount = filesToArchive.length;
+
+                // Set response headers for ZIP download
+                const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+                const filename = `auth_batch_${timestamp}.zip`;
+                res.setHeader("Content-Type", "application/zip");
+                res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+                // Set header with actual file count before piping
+                res.setHeader("X-File-Count", actualFileCount.toString());
+
+                // Create zip archive
+                const archive = archiver("zip", { zlib: { level: 0 } });
+
+                // Handle archive errors
+                archive.on("error", err => {
+                    this.logger.error(`[WebUI] Batch download archive error: ${err.message}`);
+                    if (!res.headersSent) {
+                        res.status(500).json({ error: err.message, message: "batchDownloadFailed" });
+                    } else {
+                        archive.abort();
+                        res.destroy(err);
+                    }
+                });
+
+                // Pipe archive to response
+                archive.pipe(res);
+
+                // Handle client disconnect to prevent wasted resources
+                res.on("close", () => {
+                    if (!res.writableEnded) {
+                        this.logger.warn("[WebUI] Client disconnected during batch download. Aborting archive.");
+                        archive.abort();
+                    }
+                });
+
+                // Add files to archive
+                for (const file of filesToArchive) {
+                    archive.file(file.filePath, { name: file.name });
+                }
+
+                // Finalize archive
+                await archive.finalize();
+                this.logger.info(`[WebUI] Batch downloaded ${actualFileCount} auth files as ZIP.`);
+            } catch (error) {
+                this.logger.error(`[WebUI] Batch download failed: ${error.message}`);
+                if (!res.headersSent) {
+                    res.status(500).json({ error: error.message, message: "batchDownloadFailed" });
+                }
+            }
+        });
+
+        app.delete("/api/accounts/:index", isAuthenticated, async (req, res) => {
+            if (this._rejectIfSystemBusy(res)) return;
+
+            const rawIndex = req.params.index;
+            const targetIndex = Number(rawIndex);
+            const currentAuthIndex = this.serverSystem.requestHandler.currentAuthIndex;
+            const forceDelete = req.query.force === "true"; // Check if force delete is confirmed
+
+            if (!Number.isInteger(targetIndex)) {
+                return res.status(400).json({ message: "errorInvalidIndex" });
+            }
+
+            const { authSource } = this.serverSystem;
+
+            if (!authSource.initialIndices.includes(targetIndex)) {
+                return res.status(404).json({ index: targetIndex, message: "errorAccountNotFound" });
+            }
+
+            // If deleting current account without confirmation, return warning
+            if (targetIndex === currentAuthIndex && !forceDelete) {
+                return res.status(409).json({
+                    index: targetIndex,
+                    message: "warningDeleteCurrentAccount",
+                    requiresConfirmation: true,
+                });
+            }
+
+            // Abort any ongoing background preload task before deletion
+            // This prevents race conditions where background tasks continue initializing contexts
+            // that are about to be deleted
+            await this.serverSystem.browserManager.abortBackgroundPreload();
+
+            try {
+                // Delete auth file
+                authSource.removeAuth(targetIndex);
+
+                // Reload auth sources to update internal state immediately
+                authSource.reloadAuthSources();
+
+                // Always close context first, then connection
+                this.logger.info(`[WebUI] Account #${targetIndex} deleted. Closing context and connection...`);
+
+                if (targetIndex === currentAuthIndex) {
+                    // Set system busy flag to prevent new requests during cleanup
+                    const previousBusy = this.serverSystem.requestHandler.isSystemBusy === true;
+                    if (!previousBusy) {
+                        this.serverSystem.requestHandler.isSystemBusy = true;
+                    }
+                    try {
+                        // If deleting the current account, terminate its pending requests first
+                        this.serverSystem.connectionRegistry.closeMessageQueuesForAuth(targetIndex, "account_deleted");
+                        // Close context first so page is gone when _removeConnection checks
+                        await this.serverSystem.browserManager.closeContext(targetIndex);
+                        // Then close WebSocket connection
+                        this.serverSystem.connectionRegistry.closeConnectionByAuth(targetIndex);
+                    } finally {
+                        // Reset system busy flag after cleanup completes
+                        if (!previousBusy) {
+                            this.serverSystem.requestHandler.isSystemBusy = false;
+                        }
+                    }
+                } else {
+                    // Non-current account: no need for system busy flag
+                    await this.serverSystem.browserManager.closeContext(targetIndex);
+                    this.serverSystem.connectionRegistry.closeConnectionByAuth(targetIndex);
+                }
+
+                // Rebalance context pool after delete
+                this.serverSystem.browserManager.rebalanceContextPool().catch(err => {
+                    this.logger.error(`[Auth] Background rebalance failed: ${err.message}`);
+                });
+
+                this.logger.info(
+                    `[WebUI] Account #${targetIndex} deleted via web interface. Previous current account: #${currentAuthIndex}`
+                );
+                res.status(200).json({
+                    index: targetIndex,
+                    message: "accountDeleteSuccess",
+                    wasCurrentAccount: targetIndex === currentAuthIndex,
+                });
+            } catch (error) {
+                this.logger.error(`[WebUI] Failed to delete account #${targetIndex}: ${error.message}`);
+                return res.status(500).json({ error: error.message, message: "accountDeleteFailed" });
+            }
+        });
+
+        app.put("/api/settings/streaming-mode", isAuthenticated, (req, res) => {
+            const newMode = req.body.mode;
+            if (newMode === "fake" || newMode === "real") {
+                this.config.streamingMode = newMode;
+                this.logger.info(
+                    `[WebUI] Streaming mode switched by authenticated user to: ${this.config.streamingMode}`
+                );
+                res.status(200).json({ message: "settingUpdateSuccess", setting: "streamingMode", value: newMode });
+            } else {
+                res.status(400).json({ message: "errorInvalidMode" });
+            }
+        });
+
+        app.put("/api/settings/force-thinking", isAuthenticated, (req, res) => {
+            this.config.forceThinking = !this.config.forceThinking;
+            const statusText = this.config.forceThinking;
+            this.logger.info(`[WebUI] Force thinking toggle switched to: ${statusText}`);
+            res.status(200).json({ message: "settingUpdateSuccess", setting: "forceThinking", value: statusText });
+        });
+
+        app.put("/api/settings/force-web-search", isAuthenticated, (req, res) => {
+            this.config.forceWebSearch = !this.config.forceWebSearch;
+            const statusText = this.config.forceWebSearch;
+            this.logger.info(`[WebUI] Force web search toggle switched to: ${statusText}`);
+            res.status(200).json({ message: "settingUpdateSuccess", setting: "forceWebSearch", value: statusText });
+        });
+
+        app.put("/api/settings/force-code-execution", isAuthenticated, (req, res) => {
+            this.config.forceCodeExecution = !this.config.forceCodeExecution;
+            const statusText = this.config.forceCodeExecution;
+            this.logger.info(`[WebUI] Force code execution toggle switched to: ${statusText}`);
+            res.status(200).json({
+                message: "settingUpdateSuccess",
+                setting: "forceCodeExecution",
+                value: statusText,
+            });
+        });
+
+        app.put("/api/settings/force-url-context", isAuthenticated, (req, res) => {
+            this.config.forceUrlContext = !this.config.forceUrlContext;
+            const statusText = this.config.forceUrlContext;
+            this.logger.info(`[WebUI] Force URL context toggle switched to: ${statusText}`);
+            res.status(200).json({ message: "settingUpdateSuccess", setting: "forceUrlContext", value: statusText });
+        });
+
+        app.put("/api/settings/check-update", isAuthenticated, (req, res) => {
+            this.config.checkUpdate = !this.config.checkUpdate;
+            const statusText = this.config.checkUpdate;
+            this.logger.info(`[WebUI] Check update toggle switched to: ${statusText}`);
+            res.status(200).json({ message: "settingUpdateSuccess", setting: "checkUpdate", value: statusText });
+        });
+
+        app.put("/api/settings/enable-auth-update", isAuthenticated, (req, res) => {
+            this.config.enableAuthUpdate = !this.config.enableAuthUpdate;
+            const statusText = this.config.enableAuthUpdate;
+            this.logger.info(`[WebUI] Enable auth update toggle switched to: ${statusText}`);
+            res.status(200).json({ message: "settingUpdateSuccess", setting: "enableAuthUpdate", value: statusText });
+        });
+
+        app.put("/api/settings/safety-settings-threshold", isAuthenticated, (req, res) => {
+            const newThreshold = String(req.body?.value || "")
+                .trim()
+                .toUpperCase();
+
+            if (!this.allowedSafetyThresholds.has(newThreshold)) {
+                return res.status(400).json({ error: "Invalid safety settings threshold", message: "settingFailed" });
+            }
+
+            this.config.safetySettingsThreshold = newThreshold;
+            this.logger.info(`[WebUI] Safety settings threshold updated to: ${newThreshold}`);
+            return res.status(200).json({
+                message: "settingUpdateSuccess",
+                setting: "safetySettingsThreshold",
+                value: newThreshold,
+            });
+        });
+
+        app.put("/api/settings/debug-mode", isAuthenticated, (req, res) => {
+            const currentLevel = LoggingService.getLevel();
+            const newLevel = currentLevel === "DEBUG" ? "INFO" : "DEBUG";
+            LoggingService.setLevel(newLevel);
+            this.logger.info(`[WebUI] Log level switched to: ${newLevel}`);
+
+            // Sync browser log level via WebSocket (broadcasts to all active contexts)
+            const updatedCount = this.serverSystem.requestHandler.setBrowserLogLevel(newLevel);
+            const browserSynced = updatedCount > 0;
+            if (!browserSynced) {
+                this.logger.warn(`[WebUI] Browser log level sync failed (no active connections)`);
+            }
+
+            res.status(200).json({
+                browserSynced,
+                message: "settingUpdateSuccess",
+                setting: "logLevel",
+                updatedContexts: updatedCount,
+                value: newLevel === "DEBUG" ? "debug" : "normal",
+            });
+        });
+
+        app.put("/api/settings/log-max-count", isAuthenticated, (req, res) => {
+            const { count } = req.body;
+            const newCount = parseInt(count, 10);
+
+            if (Number.isFinite(newCount) && newCount > 0) {
+                this.logger.setDisplayLimit(newCount);
+                this.logger.info(`[WebUI] Log display limit updated to: ${newCount}`);
+                res.status(200).json({ message: "settingUpdateSuccess", setting: "logMaxCount", value: newCount });
+            } else {
+                res.status(400).json({ error: "Invalid count", message: "settingFailed" });
+            }
+        });
+
+        app.post("/api/files", isAuthenticated, async (req, res) => {
+            if (this._rejectIfSystemBusy(res)) return;
+
+            const { content } = req.body;
+            // Ignore req.body.filename - auto rename
+
+            if (!content) {
+                return res.status(400).json({ error: "Missing content" });
+            }
+
+            try {
+                // Abort any ongoing background preload task before upload
+                // This prevents race conditions where background tasks continue initializing contexts
+                // while we're adding a new account
+                await this.serverSystem.browserManager.abortBackgroundPreload();
+
+                // Ensure directory exists
+                const configDir = path.join(process.cwd(), "configs", "auth");
+                if (!fs.existsSync(configDir)) {
+                    fs.mkdirSync(configDir, { recursive: true });
+                }
+
+                // If content is object, stringify it
+                const fileContent = typeof content === "object" ? JSON.stringify(content, null, 2) : content;
+
+                // Always use max index + 1 to ensure new auth is always the latest
+                // This simplifies dedup logic assumption: higher index = newer auth
+                const existingIndices = this.serverSystem.authSource.availableIndices || [];
+                const nextAuthIndex = existingIndices.length > 0 ? Math.max(...existingIndices) + 1 : 0;
+
+                const newFilename = `auth-${nextAuthIndex}.json`;
+                const filePath = path.join(configDir, newFilename);
+
+                await fs.promises.writeFile(filePath, fileContent);
+
+                // Reload auth sources to pick up changes
+                this.serverSystem.authSource.reloadAuthSources();
+
+                // Rebalance context pool to pick up new account
+                this.serverSystem.browserManager.rebalanceContextPool().catch(err => {
+                    this.logger.error(`[Auth] Background rebalance failed: ${err.message}`);
+                });
+
+                this.logger.info(`[WebUI] File uploaded via API: generated ${newFilename}`);
+                res.status(200).json({ filename: newFilename, message: "File uploaded successfully" });
+            } catch (error) {
+                this.logger.error(`[WebUI] Failed to write file: ${error.message}`);
+                res.status(500).json({ error: "Failed to save file" });
+            }
+        });
+
+        // Batch upload files
+        app.post("/api/files/batch", isAuthenticated, async (req, res) => {
+            if (this._rejectIfSystemBusy(res)) return;
+
+            const { files } = req.body;
+
+            if (!Array.isArray(files) || files.length === 0) {
+                return res.status(400).json({ error: "Missing files array" });
+            }
+
+            try {
+                // Abort any ongoing background preload task before batch upload
+                // This prevents race conditions where background tasks continue initializing contexts
+                // while we're adding multiple new accounts
+                await this.serverSystem.browserManager.abortBackgroundPreload();
+
+                // Ensure directory exists
+                const configDir = path.join(process.cwd(), "configs", "auth");
+                if (!fs.existsSync(configDir)) {
+                    fs.mkdirSync(configDir, { recursive: true });
+                }
+
+                const results = [];
+
+                // Get starting index
+                const existingIndices = this.serverSystem.authSource.availableIndices || [];
+                let nextAuthIndex = existingIndices.length > 0 ? Math.max(...existingIndices) + 1 : 0;
+
+                // Write all files first, track each file's result
+                for (let i = 0; i < files.length; i++) {
+                    const content = files[i];
+
+                    if (!content) {
+                        results.push({ error: "Missing content", index: i, success: false });
+                        continue;
+                    }
+
+                    try {
+                        // If content is object, stringify it
+                        const fileContent = typeof content === "object" ? JSON.stringify(content, null, 2) : content;
+
+                        const newFilename = `auth-${nextAuthIndex}.json`;
+                        const filePath = path.join(configDir, newFilename);
+
+                        await fs.promises.writeFile(filePath, fileContent);
+
+                        results.push({ filename: newFilename, index: i, success: true });
+                        this.logger.info(`[WebUI] Batch upload: generated ${newFilename}`);
+
+                        nextAuthIndex++;
+                    } catch (error) {
+                        results.push({ error: error.message, index: i, success: false });
+                        this.logger.error(`[WebUI] Batch upload failed for file ${i}: ${error.message}`);
+                    }
+                }
+
+                // Only reload and rebalance once after all files are written
+                const successCount = results.filter(r => r.success).length;
+                if (successCount > 0) {
+                    this.serverSystem.authSource.reloadAuthSources();
+                    this.serverSystem.browserManager.rebalanceContextPool().catch(err => {
+                        this.logger.error(`[Auth] Background rebalance failed: ${err.message}`);
+                    });
+                }
+
+                const failureCount = results.length - successCount;
+                if (failureCount > 0) {
+                    return res.status(207).json({
+                        message: "Batch upload partially successful",
+                        results,
+                        successCount,
+                    });
+                }
+
+                res.status(200).json({
+                    message: "Batch upload successful",
+                    results,
+                    successCount,
+                });
+            } catch (error) {
+                this.logger.error(`[WebUI] Batch upload failed: ${error.message}`);
+                res.status(500).json({ error: "Failed to upload files" });
+            }
+        });
+
+        app.get("/api/files/:filename", isAuthenticated, (req, res) => {
+            const filename = req.params.filename;
+            // Security check
+            if (!/^[a-zA-Z0-9.-]+$/.test(filename) || filename.includes("..")) {
+                return res.status(400).json({ error: "Invalid filename" });
+            }
+            const filePath = path.join(process.cwd(), "configs", "auth", filename);
+            if (!fs.existsSync(filePath)) {
+                return res.status(404).json({ error: "File not found" });
+            }
+            res.download(filePath);
+        });
+    }
+
+    _getStatusData() {
+        const { config, requestHandler, authSource, browserManager } = this.serverSystem;
+        const initialIndices = authSource.initialIndices || [];
+        const invalidIndices = initialIndices.filter(i => !authSource.availableIndices.includes(i));
+        const rotationIndices = authSource.getRotationIndices();
+        const duplicateIndices = authSource.duplicateIndices || [];
+        const expiredIndices = authSource.expiredIndices || [];
+        const limit = this.logger.displayLimit || 100;
+        const allLogs = this.logger.logBuffer || [];
+        const displayLogs = allLogs.slice(-limit);
+        const accountNameMap = authSource.accountNameMap;
+        const accountDetails = initialIndices.map(index => {
+            const isInvalid = invalidIndices.includes(index);
+            const name = isInvalid ? null : accountNameMap.get(index) || null;
+
+            const canonicalIndex = isInvalid ? null : authSource.getCanonicalIndex(index);
+            const isDuplicate = canonicalIndex !== null && canonicalIndex !== index;
+            const isRotation = rotationIndices.includes(index);
+            const isExpired = expiredIndices.includes(index);
+
+            const hasContext = browserManager.contexts.has(index);
+
+            return { canonicalIndex, hasContext, index, isDuplicate, isExpired, isInvalid, isRotation, name };
+        });
+
+        const currentAuthIndex = requestHandler.currentAuthIndex;
+        const currentAccountName = accountNameMap.get(currentAuthIndex) || "N/A";
+
+        const usageCount =
+            config.switchOnUses > 0
+                ? `${requestHandler.usageCount} / ${config.switchOnUses}`
+                : requestHandler.usageCount;
+
+        const failureCount =
+            config.failureThreshold > 0
+                ? `${requestHandler.failureCount} / ${config.failureThreshold}`
+                : requestHandler.failureCount;
+
+        return {
+            logCount: displayLogs.length,
+            logs: displayLogs.join("\n"),
+            status: {
+                accountDetails,
+                activeContextsCount: browserManager.contexts.size,
+                apiKeySource: config.apiKeySource,
+                browserConnected: !!this.serverSystem.connectionRegistry.getConnectionByAuth(currentAuthIndex, false),
+                checkUpdate: config.checkUpdate,
+                currentAccountName,
+                currentAuthIndex,
+                debugMode: LoggingService.isDebugEnabled(),
+                duplicateIndicesRaw: duplicateIndices,
+                enableAuthUpdate: config.enableAuthUpdate,
+                expiredIndicesRaw: expiredIndices,
+                failureCount,
+                forceCodeExecution: config.forceCodeExecution,
+                forceThinking: config.forceThinking,
+                forceUrlContext: config.forceUrlContext,
+                forceWebSearch: config.forceWebSearch,
+                immediateSwitchStatusCodes:
+                    config.immediateSwitchStatusCodes.length > 0
+                        ? `[${config.immediateSwitchStatusCodes.join(", ")}]`
+                        : "Disabled",
+                initialIndicesRaw: initialIndices,
+                invalidIndicesRaw: invalidIndices,
+                isSystemBusy: requestHandler.isSystemBusy,
+                logMaxCount: limit,
+                maxContexts: config.maxContexts,
+                maxRetries: config.maxRetries,
+                rotationIndicesRaw: rotationIndices,
+                safetySettingsThreshold: config.safetySettingsThreshold,
+                streamingMode: config.streamingMode,
+                usageCount,
+            },
+        };
+    }
+}
+
+module.exports = StatusRoutes;

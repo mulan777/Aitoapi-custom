@@ -1,0 +1,359 @@
+# Google AI Studio Build App to API Adapter
+
+[中文文档](README.md) | English
+
+A tool that wraps the Google AI Studio Build App web interface to provide OpenAI API, Gemini API, and Anthropic API compatible endpoints. The service acts as a proxy, converting API requests into browser interactions with the AI Studio Build App interface.
+
+## ✨ Features
+
+- 🔄 **API Compatibility**: Compatible with OpenAI API, Gemini API, and Anthropic API formats
+- 🌐 **Web Automation**: Uses browser automation to interact with AI Studio Build
+- 👥 **Multi-Account Support**: Support multiple Google accounts logged in simultaneously for fast switching without re-login
+- 🔧 **Tool Calls Support**: OpenAI, Gemini, and Anthropic APIs all support Tool Calls (Function Calling)
+- 📝 **Model Support**: Access to various Gemini models through AI Studio, including image generation and TTS (text-to-speech) models
+- 🎨 **Homepage Display Control**: Provides a visual web console with account management, VNC login, and more
+
+## 🚀 Quick Start
+
+### 💻 Run Directly (Windows / macOS / Linux)
+
+1. Clone the repository:
+
+   ```bash
+   git clone https://github.com/iBUHub/AIStudioToAPI.git
+   cd AIStudioToAPI
+   ```
+
+2. Run the setup script:
+
+   ```bash
+   npm run setup-auth
+   ```
+
+   For auto-fill and non-interactive examples, see the [Account Auto-fill](#-account-auto-fill) section.
+
+   This script will:
+   - Automatically download the Camoufox browser (a privacy-focused Firefox fork)
+   - Launch the browser, open AI Studio, and guide you through manual login
+   - Save your authentication credentials locally (auth files are stored in `/configs/auth`)
+
+   > 💡 **Tip:** If downloading the Camoufox browser fails or takes too long, you can manually download it from [here](https://github.com/daijro/camoufox/releases/tag/v135.0.1-beta.24), and set the environment variable `CAMOUFOX_EXECUTABLE_PATH` to the path of the browser executable (both absolute and relative paths are supported).
+
+3. Configure Environment Variables (Optional):
+
+   Copy `.env.example` in the root directory to `.env`, and modify settings in `.env` as needed (e.g., port, API Key).
+
+4. Start the service:
+
+   ```bash
+   npm start
+   ```
+
+   If the frontend assets have already been built and you only want to restart the service quickly, use:
+
+   ```bash
+   npm run quick-start
+   ```
+
+   The API server will be available at `http://localhost:7860`
+
+   After the service starts, you can access `http://localhost:7860` in your browser to open the web console homepage, where you can view account status and service status.
+   Request usage statistics are persisted locally at `/data/usage-stats.jsonl`.
+
+5. Update to the latest version (for existing local deployments):
+
+   ```bash
+   git pull
+   npm install
+   npm start
+   ```
+
+> ⚠ **Note:** Running directly does not support adding accounts via VNC online. You need to use the `npm run setup-auth` script to add accounts. VNC login is only available in Docker deployments.
+
+### 🐋 Docker Deployment
+
+Deploy using Docker without pre-extracting authentication credentials.
+
+#### 🚢 Step 1: Deploy Container
+
+##### 🎮️ Option 1: Docker Command
+
+```bash
+docker run -d \
+  --name aistudio-to-api \
+  -p 7860:7860 \
+  -v /path/to/auth:/app/configs/auth \
+  -v /path/to/data:/app/data \
+  -e API_KEYS=your-api-key-1,your-api-key-2 \
+  -e TZ=America/New_York \
+  --restart unless-stopped \
+  ghcr.io/ibuhub/aistudio-to-api:latest
+```
+
+> 💡 **Tip:** If `ghcr.io` is slow or unavailable, you can use the Docker Hub image: `ibuhub/aistudio-to-api:latest`.
+
+Parameters:
+
+- `-p 7860:7860`: API server port (if using a reverse proxy, strongly consider `127.0.0.1:7860`)
+- `-v /path/to/auth:/app/configs/auth`: Mount directory containing auth files
+- `-v /path/to/data:/app/data`: Mount persistent data directory for usage statistics (`/app/data/usage-stats.jsonl`)
+- `-e API_KEYS`: Comma-separated list of API keys for authentication
+- `-e TZ=America/New_York`: Timezone for logs (optional, defaults to system timezone)
+
+##### 📦 Option 2: Docker Compose
+
+Create a `docker-compose.yml` file:
+
+```yaml
+name: aistudio-to-api
+
+services:
+  app:
+    image: ghcr.io/ibuhub/aistudio-to-api:latest
+    container_name: aistudio-to-api
+    ports:
+      # API server port (if using a reverse proxy, strongly consider `127.0.0.1:7860`)
+      - 7860:7860
+    restart: unless-stopped
+    volumes:
+      # Mount directory containing auth files
+      - ./auth:/app/configs/auth
+      # Mount persistent data directory for usage statistics
+      - ./data:/app/data
+    environment:
+      # Comma-separated list of API keys for authentication
+      API_KEYS: your-api-key-1,your-api-key-2
+      # Timezone setting (optional, defaults to system timezone)
+      TZ: America/New_York
+```
+
+##### 🛠️ Option 3: Build from Source
+
+If you prefer to build the Docker image yourself, you can use the following commands:
+
+1. Build the image:
+
+   ```bash
+   docker build -t aistudio-to-api .
+   ```
+
+2. Run the container:
+
+   ```bash
+   docker run -d \
+     --name aistudio-to-api \
+     -p 7860:7860 \
+     -v /path/to/auth:/app/configs/auth \
+     -v /path/to/data:/app/data \
+     -e API_KEYS=your-api-key-1,your-api-key-2 \
+     -e TZ=America/New_York \
+     --restart unless-stopped \
+     aistudio-to-api
+   ```
+
+#### 🔑 Step 2: Account Management
+
+After deployment, you need to add Google accounts using one of these methods:
+
+**Method 1: VNC-Based Login (Recommended)**
+
+- Access the deployed service address in your browser (e.g., `http://your-server:7860`) and click the "Add User" button
+- You'll be redirected to a VNC page with a browser instance
+- Log in to your Google account, then click the "Save" button after login is complete
+- The account will be automatically saved as `auth-N.json` (N starts from 0)
+
+**Method 2: Upload Auth Files**
+
+- Run `npm run setup-auth` on your local machine to generate auth files (refer to steps 1 and 2 of [Run Directly](#-run-directly-windows--macos--linux)), the auth files are in `/configs/auth`
+- In the web console, click "Upload Auth" to upload the auth JSON file, or manually upload to the mounted `/path/to/auth` directory
+
+> 💡 **Tip**: You can also download auth files from an existing container and upload them to a new container. Click the "Download Auth" button for the corresponding account in the web console to download the auth file.
+
+> ⚠ Environment variable-based auth injection is no longer supported.
+
+#### 🌐 Step 3 (Optional): Nginx Reverse Proxy
+
+If you need to access via a domain name or want unified management at the reverse proxy layer (e.g., configure HTTPS, load balancing, etc.), you can use Nginx.
+
+> 📖 For detailed Nginx configuration instructions, see: [Nginx Reverse Proxy Configuration](docs/en/nginx-setup.md)
+
+### 🐾 Claw Cloud Run Deployment
+
+> ℹ **Claw Cloud Run announcement:** Since **May 11, 2026, 00:00 UTC**, Claw Cloud Run has discontinued its product and related services. See the official announcement for details:
+> [Announcement](https://question.run.claw.cloud/questions/10010000000003261)
+
+> 📖 For the legacy deployment guide, see: [Deploy on Claw Cloud Run](docs/en/claw-cloud-run.md)
+
+### 🦓 Zeabur Deployment
+
+> ℹ **Zeabur announcement:** Since **March 15, 2026**, Zeabur has stopped allowing new projects to be created on the **Shared Cluster**. **Services already running on the Shared Cluster are not affected.** See the official changelog for details:
+> [Announcement](https://zeabur.com/changelogs/phasing-out-shared-cluster)
+
+> 📖 For the legacy deployment guide, see: [Deploy on Zeabur](docs/en/zeabur.md)
+
+## 📡 API Usage
+
+### 🤖 OpenAI-Compatible API
+
+This endpoint is processed and then forwarded to the Gemini API format endpoint.
+
+- `GET /v1/models`: List models.
+- `POST /v1/chat/completions`: Chat completion and image generation, supports non-streaming, real streaming, and fake streaming.
+- `POST /v1/embeddings`: Generate text embedding vectors.
+- `POST /v1/responses`: OpenAI Responses API compatible endpoint for conversation generation, does not support image generation, and supports non-streaming, real streaming, and fake streaming.
+- `POST /v1/responses/input_tokens`: Count input tokens for an OpenAI Responses API request.
+
+### ♊ Gemini Native API Format
+
+This endpoint is forwarded to the Gemini API format endpoint.
+
+- `GET /v1beta/models`: List available Gemini models.
+- `POST /v1beta/models/{model_name}:generateContent`: Generate content, images, and speech.
+- `POST /v1beta/models/{model_name}:streamGenerateContent`: Stream content, image, and speech generation, supports real and fake streaming.
+- `POST /v1beta/models/{model_name}:embedContent`: Generate a single text embedding vector.
+- `POST /v1beta/models/{model_name}:batchEmbedContents`: Batch generate text embedding vectors.
+- `POST /v1beta/models/{model_name}:predict`: Imagen series models image generation.
+
+### 👤 Anthropic Compatible API
+
+This endpoint forwards requests to the Gemini API format endpoint.
+
+- `GET /v1/models`: List models.
+- `POST /v1/messages`: Chat message completions, supports non-streaming, real streaming, and fake streaming.
+- `POST /v1/messages/count_tokens`: Count tokens in the messages.
+
+> 📖 For detailed API usage examples, see: [API Usage Examples](docs/en/api-examples.md)
+
+## 🖥️ Recommended Frontend: AMC WebUI
+
+[AMC WebUI](https://github.com/yeahhe365/AMC-WebUI) is a Local-First Gemini workflow WebUI with multimodal chat, Canvas, file processing, realtime search, code execution, and advanced reasoning. It already supports AIStudioToAPI as a third-party Gemini-compatible backend and can be used as a graphical frontend for this project.
+
+Online demo: [https://all-model-chat.pages.dev](https://all-model-chat.pages.dev)
+
+Usage:
+
+- Deploy and start AIStudioToAPI first, and make sure the Gemini native API endpoint is reachable, for example `http://localhost:7860/v1beta`.
+- In AMC WebUI, go to **Settings -> API Configuration**, enable "Custom API Configuration", and set the Gemini-compatible Base URL to AIStudioToAPI's `/v1beta` endpoint.
+- The API Key configured in AMC WebUI should match one of the `API_KEYS` configured for AIStudioToAPI.
+
+## 🧰 Configuration
+
+### 🔧 Environment Variables
+
+#### 📱 Application Configuration
+
+| Variable                    | Description                                                                                                                                                                 | Default              |
+| :-------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------- |
+| `API_KEYS`                  | Comma-separated list of valid API keys for authentication.                                                                                                                  | `123456`             |
+| `WEB_CONSOLE_USERNAME`      | Username for web console login (optional). If both username and password are set, both are required to login.                                                               | None                 |
+| `WEB_CONSOLE_PASSWORD`      | Password for web console login (optional). If only password is set, login requires password only. If neither is set, the system falls back to `API_KEYS` for console login. | None                 |
+| `PORT`                      | API server port.                                                                                                                                                            | `7860`               |
+| `HOST`                      | Server listening host address.                                                                                                                                              | `0.0.0.0`            |
+| `ICON_URL`                  | Custom favicon URL for the console. Supports ICO, PNG, SVG, etc.                                                                                                            | `/AIStudio_logo.svg` |
+| `SECURE_COOKIES`            | Enable secure cookies. `true` for HTTPS only, `false` for both HTTP and HTTPS.                                                                                              | `false`              |
+| `RATE_LIMIT_MAX_ATTEMPTS`   | Maximum failed login attempts allowed within the time window (`0` to disable).                                                                                              | `5`                  |
+| `RATE_LIMIT_WINDOW_MINUTES` | Time window for rate limiting in minutes.                                                                                                                                   | `15`                 |
+| `CHECK_UPDATE`              | Enable version update check on page load (`false` to disable).                                                                                                              | `true`               |
+| `LOG_LEVEL`                 | Logging output level. Set to `DEBUG` for detailed debug logs.                                                                                                               | `INFO`               |
+| `TZ`                        | Timezone used for logs and displayed times, for example `America/New_York`. Defaults to the system timezone when empty.                                                     | System timezone      |
+
+#### 🌐 Proxy Configuration
+
+| Variable                        | Description                                                                                                                                                                                                                                                           | Default   |
+| :------------------------------ | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :-------- |
+| `INITIAL_AUTH_INDEX`            | Initial authentication index to use on startup.                                                                                                                                                                                                                       | `0`       |
+| `ENABLE_AUTH_UPDATE`            | Whether to enable automatic auth credential updates. Defaults to enabled. The auth file will be automatically updated upon successful login/account switch and every 24 hours. Set to `false` to disable.                                                             | `true`    |
+| `MAX_RETRIES`                   | Maximum number of retries for failed requests (only effective for fake streaming and non-streaming).                                                                                                                                                                  | `3`       |
+| `RETRY_DELAY`                   | Delay between retries in milliseconds.                                                                                                                                                                                                                                | `2000`    |
+| `STREAM_TIMEOUT_MS`             | Timeout between real streaming chunks, in milliseconds. Maximum: `300000`.                                                                                                                                                                                            | `60000`   |
+| `FAKE_STREAM_TIMEOUT_MS`        | Timeout for fake streaming / non-streaming buffered responses, in milliseconds. Maximum: `300000`.                                                                                                                                                                    | `300000`  |
+| `SWITCH_ON_USES`                | Number of requests before automatically switching accounts (`0` to disable).                                                                                                                                                                                          | `40`      |
+| `FAILURE_THRESHOLD`             | Number of consecutive failures before switching accounts (`0` to disable).                                                                                                                                                                                            | `3`       |
+| `IMMEDIATE_SWITCH_STATUS_CODES` | HTTP status codes that trigger immediate account switching (comma-separated, set to empty to disable).                                                                                                                                                                | `429,503` |
+| `MAX_CONTEXTS`                  | Maximum number of accounts that can be logged in simultaneously. Accounts logged in simultaneously can switch faster without re-login. Higher values consume more memory (approx: 1 account ~700MB, 2 accounts ~950MB, 3 accounts ~1100MB). Set to `0` for unlimited. | `1`       |
+| `HTTP_PROXY`                    | HTTP proxy address for accessing Google services.                                                                                                                                                                                                                     | None      |
+| `HTTPS_PROXY`                   | HTTPS proxy address for accessing Google services.                                                                                                                                                                                                                    | None      |
+| `NO_PROXY`                      | Comma-separated list of addresses to bypass the proxy. The project automatically bypasses local addresses (localhost, 127.0.0.1, ::, ::1 and 0.0.0.0), so manual local bypass configuration is usually not required.                                                  | None      |
+
+#### 🗒️ Other Configuration
+
+| Variable                    | Description                                                                                                                                                                           | Default       |
+| :-------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | :------------ |
+| `STREAMING_MODE`            | Streaming mode. `real` for real streaming, `fake` for fake streaming.                                                                                                                 | `real`        |
+| `ENABLE_USAGE_STATS`        | Whether to enable request usage statistics. Defaults to enabled. Set to `false` to skip loading local stats, skip writing stats, and make `/api/usage-stats` return an empty payload. | `true`        |
+| `SAFETY_SETTINGS_THRESHOLD` | Safety settings level. Official docs: [Safety settings](https://ai.google.dev/gemini-api/docs/safety-settings)                                                                        | `OFF`         |
+| `FORCE_THINKING`            | Force enable thinking mode for all requests.                                                                                                                                          | `false`       |
+| `FORCE_WEB_SEARCH`          | Force enable web search for all requests.                                                                                                                                             | `false`       |
+| `FORCE_CODE_EXECUTION`      | Force enable code execution for all requests.                                                                                                                                         | `false`       |
+| `FORCE_URL_CONTEXT`         | Force enable URL context for all requests.                                                                                                                                            | `false`       |
+| `CAMOUFOX_EXECUTABLE_PATH`  | Path to the Camoufox browser executable (supports both absolute and relative paths). Only required if manually downloaded.                                                            | Auto-detected |
+
+### ⚡ Account Auto-fill
+
+To simplify the login process for multiple accounts, you can configure the `users.csv` file for auto-fill:
+
+1. Create `users.csv` in the project root.
+2. Format: `email,password,recovery_email,totp_secret` (one per line, `recovery_email` and `totp_secret` are optional).
+3. Run `npm run setup-auth` and select the account when prompted.
+
+> 📖 For detailed configuration instructions, see: [Account Auto-fill Guide](docs/en/auto-fill-guide.md)
+>
+> 💡 **Tip**: For promptless runs, use `npm run setup-auth -- --non-interactive --account 1`, or pass `--email` / `--password` directly.
+>
+> 💡 **Batch add**: Use `npm run setup-auth-batch -- --headless` to add every account in `users.csv` sequentially.
+
+### 🧠 Model List Configuration
+
+Edit `configs/models.json` to customize available models and their settings.
+
+> 💡 **Tip:** The thinking parameter reserves the function to be set via the model suffix. It supports setting the thinking level by appending `-THINKING_LEVEL` or `(THINKING_LEVEL)` to the model name (`THINKING_LEVEL` supports `high`, `low`, `medium`, `minimal`, case-insensitive). For example: `gemini-3-flash-preview(minimal)` or `gemini-3-flash-preview-minimal`.
+>
+> Streaming mode can also be overridden with `-real` or `-fake`. This override has higher priority than the system streaming mode, but it only takes effect for streaming requests. For example: `gemini-3-flash-preview-fake`. When used together with a thinking suffix, the streaming suffix should come after the thinking suffix, for example: `gemini-3-flash-preview-minimal-fake` or `gemini-3-flash-preview(minimal)-real`.
+>
+> Web search and code execution can also be forced on with model suffixes: append `-search` for web search and `-code` for code execution. For example: `gemini-3-flash-preview-search` or `gemini-3-flash-preview-code`. When combined with other suffixes, built-in tool suffixes should come last; the full combined order is `thinking -> streaming -> built-in tools`, for example: `gemini-3-flash-preview-minimal-search`, `gemini-3-flash-preview-real-code`, or `gemini-3-flash-preview(minimal)-fake-search-code`.
+
+### 🌐 Sticky Per-Account Proxy
+
+Create `proxylist.txt` in the project root to enable sticky per-account proxies. Add one HTTP proxy per line. Supported formats:
+
+```text
+user:pass@ip:port
+ip:port:user:pass
+ip:port
+http://user:pass@ip:port
+```
+
+When `proxylist.txt` contains at least one valid proxy, the service writes `proxy_mapping.json` and assigns the first free proxy to each active account. Existing account assignments are kept as long as the account still exists and the proxy is still present in `proxylist.txt`. If an account or proxy is removed, its stale mapping is removed automatically. If there are more active accounts than proxies, accounts without an assigned proxy will not start until more proxies are added.
+
+`proxy_mapping.json` is created in the project root. It is a JSON object that maps an account key to the original proxy line, for example:
+
+```json
+{
+  "user@example.com": "user:pass@1.2.3.4:8080",
+  "auth-1": "5.6.7.8:8080"
+}
+```
+
+VNC-based account binding also uses sticky proxies. A new VNC login session reserves a free proxy before opening the browser, and after the account is saved that proxy is persisted to the detected account in `proxy_mapping.json`. If sticky proxy mode is enabled and no free proxy is available, the VNC session fails instead of falling back to the server's direct IP.
+
+Sticky proxies use the same bypass rules as `HTTP_PROXY` / `HTTPS_PROXY`: local addresses are bypassed by default, and custom entries can be added with `NO_PROXY`:
+
+```bash
+NO_PROXY=internal.example.com,10.0.0.0/8
+```
+
+## 📄 License
+
+This project is a fork of [**ais2api**](https://github.com/Ellinav/ais2api) by [**Ellinav**](https://github.com/Ellinav), and fully adopts the CC BY-NC 4.0 license used by the upstream project. All usage, distribution, and modification activities must comply with all terms of the original license. See the full license text in [LICENSE](LICENSE).
+
+## 🤝 Contributors
+
+[![Contributors](https://contrib.rocks/image?repo=iBUHub/AIStudioToAPI)](https://github.com/iBUHub/AIStudioToAPI/graphs/contributors)
+
+We would like to thank all developers who have contributed their time, effort, and wisdom to this project.
+
+---
+
+If you find AIStudioToAPI useful, consider giving it a ⭐️!
+
+[![Star History Chart](https://api.star-history.com/svg?repos=iBUHub/AIStudioToAPI&type=date&legend=top-left)](https://www.star-history.com/#iBUHub/AIStudioToAPI&type=date&legend=top-left)

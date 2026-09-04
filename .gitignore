@@ -1,0 +1,40 @@
+.vscode/
+.idea/
+.cursor/
+.DS_Store
+.claude/
+
+# Environment variables (keep .env.example)
+.env
+.env.local
+.env.*.local
+.env.development
+.env.production
+
+# Node.js dependencies
+node_modules/
+
+# Camoufox browser
+camoufox/
+camoufox-linux/
+camoufox-macos/
+camoufox*.zip
+
+# Authentication files
+configs/auth/
+auth-*.json
+users.csv
+cache/
+
+# Usage statistics data
+data/
+
+# Temporary files
+tmp/
+temp/
+*.css
+test/
+debug_*.png
+debug_*.html
+proxylist.txt
+proxy_mapping.json

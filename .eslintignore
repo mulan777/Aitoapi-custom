@@ -1,0 +1,25 @@
+# ESLint ignore configuration
+
+# ESLint config file
+.eslintrc.js
+
+# Dependencies
+node_modules/
+
+# Browser binary
+camoufox/
+
+# Temporary files
+tmp/
+
+# Config files
+configs/
+
+# Build outputs
+dist/
+ui/dist/
+build/
+ui/dist/
+
+# Logs
+*.log
