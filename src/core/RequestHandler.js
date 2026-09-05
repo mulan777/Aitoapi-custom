@@ -174,8 +174,13 @@ class RequestHandler {
         }
 
         try {
-            await this.browserManager.launchOrSwitchContext(authIndex);
-            const contextData = this.browserManager.contexts.get(authIndex);
+            // Prefer the already-loaded context so a diagnostic click does
+            // not move the global UI account or disturb another request.
+            let contextData = this.browserManager.contexts.get(authIndex);
+            if (!contextData) {
+                await this.browserManager.launchOrSwitchContext(authIndex);
+                contextData = this.browserManager.contexts.get(authIndex);
+            }
             const connection = this.connectionRegistry.getConnectionByAuth(authIndex, false);
             if (!contextData?.page || contextData.page.isClosed() || !connection || connection.readyState !== 1) {
                 return { message: "Account context or WebSocket is not ready.", status: 503, success: false };
@@ -185,12 +190,20 @@ class RequestHandler {
                 `[AccountTest#${authIndex}]`,
                 authIndex
             );
-            this.clearAccountCooldown(authIndex);
-            this._markAccountSuccess(authIndex);
+            // A connectivity test does not prove that an upstream 429 quota
+            // window has elapsed. Keep an active rate-limit quarantine intact;
+            // otherwise clicking "Test" could immediately send new traffic to
+            // the account that was just rate-limited.
+            const routeState = this._getAccountRouteState(authIndex);
+            const cooldownActive = routeState.cooldownUntil > Date.now();
+            if (!cooldownActive) {
+                this._markAccountSuccess(authIndex);
+            }
             return {
                 ...this.getAccountRouteStatus(authIndex),
                 authIndex,
                 connected: true,
+                cooldownPreserved: cooldownActive,
                 hasContext: true,
                 success: true,
             };
@@ -849,18 +862,63 @@ class RequestHandler {
 
     async _ensureBrowserBackedRequestReady(res, options = {}) {
         const { logPrefix = "Request", waitErrorType = null, waitOptions, authIndex, requestId } = options;
-        const targetAuthIndex = this._getRequestAuthIndex(requestId, authIndex);
+        let targetAuthIndex = this._getRequestAuthIndex(requestId, authIndex);
 
         if (targetAuthIndex < 0) {
-            const cooldownMs = this.getNextCooldownMs();
-            if (cooldownMs > 0) {
-                res.setHeader("Retry-After", Math.ceil(cooldownMs / 1000));
-                this._sendErrorResponse(res, 429, "All accounts are temporarily rate-limited.", waitErrorType);
+            // Startup/recovery can briefly have no current account while a
+            // background context is already ready. Bind to that connection
+            // before returning a transient 503.
+            const replacementAuthIndex = this._selectRequestAuthIndex();
+            if (replacementAuthIndex >= 0) {
+                targetAuthIndex = replacementAuthIndex;
+                this._bindRequestAuthIndex(requestId, replacementAuthIndex);
             } else {
-                this._sendErrorResponse(res, 503, "No healthy account connection is available.", waitErrorType);
+                const cooldownMs = this.getNextCooldownMs();
+                if (cooldownMs > 0) {
+                    res.setHeader("Retry-After", Math.ceil(cooldownMs / 1000));
+                    this._sendErrorResponse(res, 429, "All accounts are temporarily rate-limited.", waitErrorType);
+                } else {
+                    // No live connection exists yet. Run the normal recovery
+                    // path so an initial request can initialize an account
+                    // instead of failing before recovery gets a chance.
+                    const recovered = await this._handleBrowserRecovery(res);
+                    if (!recovered) {
+                        this._markTrackedEarlyExitIfNeeded(res, "No schedulable account connection.");
+                        return false;
+                    }
+
+                    const recoveredAuthIndex = this._selectRequestAuthIndex();
+                    if (recoveredAuthIndex < 0) {
+                        this._sendErrorResponse(res, 503, "No healthy account connection is available.", waitErrorType);
+                        this._markTrackedEarlyExitIfNeeded(res, "No schedulable account connection.");
+                        return false;
+                    }
+                    targetAuthIndex = recoveredAuthIndex;
+                    this._bindRequestAuthIndex(requestId, recoveredAuthIndex);
+                }
             }
-            this._markTrackedEarlyExitIfNeeded(res, "No schedulable account connection.");
-            return false;
+            if (targetAuthIndex < 0) {
+                this._markTrackedEarlyExitIfNeeded(res, "No schedulable account connection.");
+                return false;
+            }
+        }
+
+        // A request may have been assigned while the account was healthy, then
+        // waited behind another request that received 429. Re-check the
+        // quarantine immediately before touching the browser connection.
+        const targetRouteState = this._getAccountRouteState(targetAuthIndex);
+        if (targetRouteState.cooldownUntil > Date.now()) {
+            const replacementAuthIndex = this._selectRequestAuthIndex([targetAuthIndex]);
+            if (replacementAuthIndex >= 0) {
+                targetAuthIndex = replacementAuthIndex;
+                this._bindRequestAuthIndex(requestId, replacementAuthIndex);
+            } else {
+                const cooldownMs = this.getNextCooldownMs();
+                res.setHeader("Retry-After", Math.max(1, Math.ceil(cooldownMs / 1000)));
+                this._sendErrorResponse(res, 429, "All accounts are temporarily rate-limited.", waitErrorType);
+                this._markTrackedEarlyExitIfNeeded(res, "Assigned account entered 429 cooldown.");
+                return false;
+            }
         }
 
         // Check the request's account connection. Do not consult the mutable global

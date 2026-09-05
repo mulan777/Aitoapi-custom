@@ -101,12 +101,61 @@ const testForwardUsesSelectedAccount = () => {
     assert.strictEqual(JSON.parse(connections.get(1).sent[0]).request_id, "request-3");
 };
 
+const testAccountTestPreservesActiveCooldown = async () => {
+    const { handler } = makeHandler();
+    const page = {
+        isClosed: () => false,
+    };
+    handler.authSource = { availableIndices: [0] };
+    handler.browserManager = {
+        async _checkPageStatusAndErrors() {},
+        contexts: new Map([[0, { page }]]),
+        launchCalls: 0,
+        async launchOrSwitchContext() {
+            this.launchCalls += 1;
+        },
+    };
+    handler._markAccount429(0, { message: "rate limited", status: 429 });
+    const before = handler.getAccountRouteStatus(0);
+
+    const result = await handler.testAccount(0);
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.cooldownPreserved, true);
+    assert.strictEqual(handler.browserManager.launchCalls, 0);
+    assert.strictEqual(handler.getAccountRouteStatus(0).cooldownUntil, before.cooldownUntil);
+};
+
+const testReadyCheckMovesQueuedRequestOffCooldownAccount = async () => {
+    const { handler } = makeHandler();
+    handler.browserManager = { notifyUserActivity() {} };
+    handler._markTrackedEarlyExitIfNeeded = () => {};
+    handler._sendErrorResponse = () => {
+        throw new Error("unexpected error response");
+    };
+    handler._bindRequestAuthIndex("request-5", 0);
+    handler._markAccount429(0, { message: "rate limited", status: 429 });
+
+    const response = {
+        setHeader() {},
+    };
+    const ready = await handler._ensureBrowserBackedRequestReady(response, {
+        authIndex: 0,
+        requestId: "request-5",
+    });
+
+    assert.strictEqual(ready, true);
+    assert.strictEqual(handler._getRequestAuthIndex("request-5"), 1);
+};
+
 (async () => {
     testRoundRobinAndBinding();
     await testFailureDoesNotGloballySwitch();
     testLeastLoadedTieBreak();
     await test429QuarantinesAccount();
     testForwardUsesSelectedAccount();
+    await testAccountTestPreservesActiveCooldown();
+    await testReadyCheckMovesQueuedRequestOffCooldownAccount();
     console.log("request routing tests: PASS");
 })().catch(error => {
     console.error(error.stack || error.message);
