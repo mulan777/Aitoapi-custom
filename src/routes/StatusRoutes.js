@@ -389,6 +389,23 @@ class StatusRoutes {
             }
         });
 
+        // Test one account without generating model content. This makes it
+        // possible to verify a single auth/WebSocket path from the console.
+        app.post("/api/accounts/:index/test", isAuthenticated, async (req, res) => {
+            const targetIndex = Number(req.params.index);
+            if (!Number.isInteger(targetIndex) || targetIndex < 0) {
+                return res.status(400).json({ message: "Invalid account index." });
+            }
+
+            try {
+                const result = await this.serverSystem.requestHandler.testAccount(targetIndex);
+                return res.status(result.success ? 200 : result.status || 503).json(result);
+            } catch (error) {
+                this.logger.error(`[WebUI] Account test failed for #${targetIndex}: ${error.message}`);
+                return res.status(503).json({ authIndex: targetIndex, message: error.message, success: false });
+            }
+        });
+
         // Batch delete accounts - Must be defined before /api/accounts/:index to avoid index matching "batch"
         app.delete("/api/accounts/batch", isAuthenticated, async (req, res) => {
             if (this._rejectIfSystemBusy(res)) return;
@@ -982,8 +999,19 @@ class StatusRoutes {
             const isExpired = expiredIndices.includes(index);
 
             const hasContext = browserManager.contexts.has(index);
+            const route = requestHandler.getAccountRouteStatus(index);
 
-            return { canonicalIndex, hasContext, index, isDuplicate, isExpired, isInvalid, isRotation, name };
+            return {
+                canonicalIndex,
+                hasContext,
+                index,
+                isDuplicate,
+                isExpired,
+                isInvalid,
+                isRotation,
+                name,
+                route,
+            };
         });
 
         const currentAuthIndex = requestHandler.currentAuthIndex;

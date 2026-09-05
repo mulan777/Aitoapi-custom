@@ -1,3 +1,5 @@
+/* global document */
+
 /**
  * File: src/core/BrowserManager.js
  * Description: Browser manager for launching and controlling headless Firefox instances with authentication contexts
@@ -66,11 +68,13 @@ class BrowserManager {
         this._isSystemBusyProvider = null;
         this.pendingContextClosures = new Map();
 
-        // Background wakeup service status (instance-level, tracks this.page)
-        // Prevents multiple BackgroundWakeup instances from running simultaneously
+        // Background wakeup service status is tracked per auth context. The old
+        // implementation followed this.page, so switching the legacy current
+        // account silently stopped Rocket/Launch handling for other accounts.
+        this.backgroundWakeups = new Map(); // authIndex -> worker state
         this.backgroundWakeupRunning = false;
 
-        // Added for background wakeup logic from new core
+        // Legacy mirror for callers that only know about the current account.
         this.noButtonCount = 0;
 
         // WebSocket initialization state per context - prevents cross-contamination
@@ -511,9 +515,15 @@ class BrowserManager {
      * Interface: Notify user activity
      * Used to force wake up the Launch detection when a request comes in
      */
-    notifyUserActivity() {
-        if (this.noButtonCount > 0) {
-            this.logger.info("[Browser] ⚡ User activity detected, forcing Launch detection wakeup...");
+    notifyUserActivity(authIndex = this._currentAuthIndex) {
+        const wakeupState = this.backgroundWakeups.get(authIndex);
+        if (wakeupState && wakeupState.noButtonCount > 0) {
+            this.logger.info(`[Browser#${authIndex}] ⚡ User activity detected, forcing Launch detection wakeup...`);
+            wakeupState.noButtonCount = 0;
+            if (authIndex === this._currentAuthIndex) this.noButtonCount = 0;
+            if (wakeupState.wake) wakeupState.wake();
+        } else if (authIndex === this._currentAuthIndex && this.noButtonCount > 0) {
+            // Preserve the legacy behavior during the short startup window.
             this.noButtonCount = 0;
         }
     }
@@ -775,8 +785,8 @@ class BrowserManager {
         this.page = pg;
         this._currentAuthIndex = authIndex;
         this.noButtonCount = 0;
-        this._startHealthMonitor();
-        this._startBackgroundWakeup();
+        this._startHealthMonitor(authIndex);
+        this._startBackgroundWakeup(authIndex);
         this._sendActiveTrigger("[Browser]", pg);
     }
 
@@ -927,8 +937,7 @@ class BrowserManager {
      * Periodically cleans up popups and keeps the session alive.
      * In multi-context mode, stores the interval in the context data.
      */
-    _startHealthMonitor() {
-        const authIndex = this._currentAuthIndex;
+    _startHealthMonitor(authIndex = this._currentAuthIndex) {
         if (authIndex < 0) {
             this.logger.warn("[Browser] Cannot start health monitor: no active auth index");
             return;
@@ -953,13 +962,6 @@ class BrowserManager {
         // Run every 4 seconds
         contextData.healthMonitorInterval = setInterval(async () => {
             try {
-                // Check if this is still the current active account
-                // This prevents background contexts from running healthMonitor unnecessarily
-                if (this._currentAuthIndex !== authIndex) {
-                    // Silently skip - this context is not active
-                    return;
-                }
-
                 const page = contextData.page;
                 // Double check page status
                 if (!page || page.isClosed()) {
@@ -1116,206 +1118,242 @@ class BrowserManager {
     /**
      * Feature: Background Wakeup & "Launch" Button Handler
      * Specifically handles the "Rocket/Launch" button which blocks model loading.
-     * This service is bound to this.page (instance-level), not individual contexts.
-     * Only one instance should run at a time, tracking the current active page.
+     * A worker is started for each logged-in auth context.
      */
-    async _startBackgroundWakeup() {
-        // Prevent multiple instances from running simultaneously
-        if (this.backgroundWakeupRunning) {
-            this.logger.info("[Browser] BackgroundWakeup already running, skipping duplicate start.");
-            return;
-        }
-
-        this.logger.debug("[Browser] Starting BackgroundWakeup initialization...");
-        this.backgroundWakeupRunning = true;
-
-        // Initial buffer - wait before starting the main loop to let page stabilize
-        await new Promise(r => setTimeout(r, 1500));
-
-        // Verify page is still valid after the initial delay
-        try {
-            if (!this.page || this.page.isClosed()) {
-                this.backgroundWakeupRunning = false;
-                this.logger.info(
-                    "[Browser] BackgroundWakeup stopped: page became null or closed during startup delay."
-                );
-                return;
-            }
-        } catch (error) {
-            this.backgroundWakeupRunning = false;
-            this.logger.warn(`[Browser] BackgroundWakeup stopped: error checking page status: ${error.message}`);
-            return;
-        }
-
-        this.logger.info("[Browser] 🛡️ Background Wakeup Service (Rocket Handler) started...");
-
-        // Main loop: directly use this.page, automatically follows context switches
-        while (this.page && !this.page.isClosed()) {
-            try {
-                const currentPage = this.page; // Capture for this iteration
-
-                // 1. Force page wake-up
-                await currentPage.bringToFront().catch(() => {});
-
-                // Micro-movements to trigger rendering frames in headless mode
-                const vp = currentPage.viewportSize() || { height: 1080, width: 1920 };
-                const moveX = Math.floor(Math.random() * (vp.width * 0.3));
-                const moveY = Math.floor(Math.random() * (vp.height * 0.3));
-                await this._simulateHumanMovement(currentPage, moveX, moveY);
-
-                // 2. Intelligent Scan for "Launch" or "Rocket" button
-                const targetInfo = await currentPage.evaluate(() => {
-                    // Optimized precise check
-                    try {
-                        const preciseCandidates = Array.from(
-                            // eslint-disable-next-line no-undef
-                            document.querySelectorAll(".interaction-modal p, .interaction-modal button")
-                        );
-                        for (const el of preciseCandidates) {
-                            if (/Launch|rocket_launch/i.test((el.innerText || "").trim())) {
-                                const rect = el.getBoundingClientRect();
-                                if (rect.width > 0 && rect.height > 0) {
-                                    return {
-                                        found: true,
-                                        tagName: el.tagName,
-                                        text: (el.innerText || "").trim().substring(0, 15),
-                                        x: rect.left + rect.width / 2,
-                                        y: rect.top + rect.height / 2,
-                                    };
-                                }
-                            }
-                        }
-                    } catch (e) {
-                        /* empty */
-                    }
-
-                    const MIN_Y = 400;
-                    const MAX_Y = 800;
-
-                    const isValid = rect => rect.width > 0 && rect.height > 0 && rect.top > MIN_Y && rect.top < MAX_Y;
-
-                    // eslint-disable-next-line no-undef
-                    const candidates = Array.from(document.querySelectorAll("button, span, div, a, i"));
-
-                    for (const el of candidates) {
-                        const text = (el.innerText || "").trim();
-                        // Match "Launch" or material icon "rocket_launch"
-                        if (!/Launch|rocket_launch/i.test(text)) continue;
-
-                        let targetEl = el;
-                        let rect = targetEl.getBoundingClientRect();
-
-                        // Recursive parent check (up to 3 levels)
-                        let parentDepth = 0;
-                        while (parentDepth < 3 && targetEl.parentElement) {
-                            if (targetEl.tagName === "BUTTON" || targetEl.getAttribute("role") === "button") break;
-                            const parent = targetEl.parentElement;
-                            const pRect = parent.getBoundingClientRect();
-                            if (isValid(pRect)) {
-                                targetEl = parent;
-                                rect = pRect;
-                            }
-                            parentDepth++;
-                        }
-
-                        if (isValid(rect)) {
-                            return {
-                                found: true,
-                                tagName: targetEl.tagName,
-                                text: text.substring(0, 15),
-                                x: rect.left + rect.width / 2,
-                                y: rect.top + rect.height / 2,
-                            };
-                        }
-                    }
-                    return { found: false };
-                });
-
-                // 3. Execute Click if found
-                if (targetInfo.found) {
-                    this.logger.info(`[Browser] 🎯 Found Rocket/Launch button [${targetInfo.tagName}], engaging...`);
-
-                    // Physical Click
-                    await currentPage.mouse.move(targetInfo.x, targetInfo.y, { steps: 5 });
-                    await new Promise(r => setTimeout(r, 300));
-                    await currentPage.mouse.down();
-                    await new Promise(r => setTimeout(r, 400));
-                    await currentPage.mouse.up();
-
-                    this.logger.info(`[Browser] 🖱️ Physical click executed. Verifying...`);
-                    await new Promise(r => setTimeout(r, 1500));
-
-                    // Strategy B: JS Click (Fallback)
-                    const isStillThere = await currentPage.evaluate(() => {
-                        // eslint-disable-next-line no-undef
-                        const els = Array.from(document.querySelectorAll('button, span, div[role="button"]'));
-                        return els.some(el => {
-                            const r = el.getBoundingClientRect();
-                            return (
-                                /Launch|rocket_launch/i.test(el.innerText) && r.top > 400 && r.top < 800 && r.height > 0
-                            );
-                        });
-                    });
-
-                    if (isStillThere) {
-                        this.logger.warn(`[Browser] ⚠️ Physical click ineffective, attempting JS force click...`);
-                        await currentPage.evaluate(() => {
-                            const candidates = Array.from(
-                                // eslint-disable-next-line no-undef
-                                document.querySelectorAll('button, span, div[role="button"]')
-                            );
-                            for (const el of candidates) {
-                                const r = el.getBoundingClientRect();
-                                if (/Launch|rocket_launch/i.test(el.innerText) && r.top > 400 && r.top < 800) {
-                                    (el.closest("button") || el).click();
-                                    return true;
-                                }
-                            }
-                        });
-                        await new Promise(r => setTimeout(r, 2000));
-                    } else {
-                        this.logger.info(`[Browser] ✅ Click successful, button disappeared.`);
-                        // Long sleep on success, but check for context switches every second
-                        for (let i = 0; i < 60; i++) {
-                            if (this.noButtonCount === 0) {
-                                this.logger.info(`[Browser] ⚡ Woken up early due to user activity or context switch.`);
-                                break; // Wake up early if user activity detected
-                            }
-                            await new Promise(r => setTimeout(r, 1000));
-                        }
-                    }
-                } else {
-                    this.noButtonCount++;
-                    // Smart Sleep
-                    if (this.noButtonCount > 20) {
-                        // Long sleep, but check for user activity
-                        for (let i = 0; i < 30; i++) {
-                            if (this.noButtonCount === 0) break; // Woken up by request
-                            await new Promise(r => setTimeout(r, 1000));
-                        }
-                    } else {
-                        await new Promise(r => setTimeout(r, 1500));
-                    }
-                }
-            } catch (e) {
-                // Ignore errors during page navigation/reload
-                await new Promise(r => setTimeout(r, 1000));
-            }
-        }
-
-        // Reset flag when loop exits
-        this.backgroundWakeupRunning = false;
-
-        // Log the reason for stopping
-        if (!this.page) {
-            this.logger.info("[Browser] Background Wakeup Service stopped: this.page is null.");
-        } else if (this.page.isClosed()) {
-            this.logger.info("[Browser] Background Wakeup Service stopped: this.page was closed.");
-        } else {
-            this.logger.info("[Browser] Background Wakeup Service stopped: unknown reason.");
-        }
+    _syncBackgroundWakeupLegacyState(authIndex = this._currentAuthIndex) {
+        this.backgroundWakeupRunning = Array.from(this.backgroundWakeups.values()).some(state => state.running);
+        const state = this.backgroundWakeups.get(authIndex);
+        this.noButtonCount = state ? state.noButtonCount : 0;
     }
 
+    _sleepBackgroundWakeup(state, delayMs) {
+        if (state.stopRequested) return Promise.resolve();
+
+        return new Promise(resolve => {
+            let settled = false;
+            const finish = () => {
+                if (settled) return;
+                settled = true;
+                if (state.timer) clearTimeout(state.timer);
+                if (state.wake === finish) state.wake = null;
+                resolve();
+            };
+
+            state.wake = finish;
+            state.timer = setTimeout(finish, delayMs);
+        });
+    }
+
+    async _stopBackgroundWakeup(authIndex, reason = "stopped") {
+        const state = this.backgroundWakeups.get(authIndex);
+        if (!state) return;
+
+        state.stopRequested = true;
+        state.noButtonCount = 0;
+        if (state.wake) state.wake();
+        if (state.done) await state.done;
+        this.logger.debug(`[Browser#${authIndex}] BackgroundWakeup stopped (${reason}).`);
+    }
+
+    /**
+     * Feature: Background Wakeup & "Launch" Button Handler
+     * Specifically handles the "Rocket/Launch" button which blocks model loading.
+     * Each logged-in auth context owns an independent worker and page reference.
+     */
+    async _startBackgroundWakeup(authIndex = this._currentAuthIndex) {
+        if (!Number.isInteger(authIndex) || authIndex < 0) return;
+
+        const contextData = this.contexts.get(authIndex);
+        const page = contextData?.page;
+        if (!page) {
+            this.logger.debug(`[Browser#${authIndex}] BackgroundWakeup skipped: page not available.`);
+            return;
+        }
+
+        const existing = this.backgroundWakeups.get(authIndex);
+        if (existing?.running) {
+            this.logger.debug(`[Browser#${authIndex}] BackgroundWakeup already running.`);
+            return existing.done;
+        }
+
+        let resolveDone;
+        const state = {
+            done: new Promise(resolve => {
+                resolveDone = resolve;
+            }),
+            noButtonCount: 0,
+            running: true,
+            stopRequested: false,
+            timer: null,
+            wake: null,
+        };
+        state.resolveDone = resolveDone;
+        this.backgroundWakeups.set(authIndex, state);
+        this._syncBackgroundWakeupLegacyState(authIndex);
+
+        const isPageAlive = () => {
+            try {
+                return !state.stopRequested && this.contexts.get(authIndex)?.page === page && !page.isClosed();
+            } catch (error) {
+                return false;
+            }
+        };
+
+        try {
+            this.logger.debug(`[Browser#${authIndex}] Starting BackgroundWakeup initialization...`);
+            await this._sleepBackgroundWakeup(state, 1500);
+            if (!isPageAlive()) return;
+
+            this.logger.info(`[Context#${authIndex}] 🛡️ Background Wakeup Service (Rocket Handler) started...`);
+
+            while (isPageAlive()) {
+                try {
+                    await page.bringToFront().catch(() => {});
+
+                    const vp = page.viewportSize() || { height: 1080, width: 1920 };
+                    const moveX = Math.floor(Math.random() * (vp.width * 0.3));
+                    const moveY = Math.floor(Math.random() * (vp.height * 0.3));
+                    await this._simulateHumanMovement(page, moveX, moveY);
+
+                    const targetInfo = await page.evaluate(() => {
+                        try {
+                            const preciseCandidates = Array.from(
+                                document.querySelectorAll(".interaction-modal p, .interaction-modal button")
+                            );
+                            for (const el of preciseCandidates) {
+                                if (/Launch|rocket_launch/i.test((el.innerText || "").trim())) {
+                                    const rect = el.getBoundingClientRect();
+                                    if (rect.width > 0 && rect.height > 0) {
+                                        return {
+                                            found: true,
+                                            tagName: el.tagName,
+                                            text: (el.innerText || "").trim().substring(0, 15),
+                                            x: rect.left + rect.width / 2,
+                                            y: rect.top + rect.height / 2,
+                                        };
+                                    }
+                                }
+                            }
+                        } catch (error) {
+                            // The page may be navigating while the scan runs.
+                        }
+
+                        const MIN_Y = 400;
+                        const MAX_Y = 800;
+                        const isValid = rect =>
+                            rect.width > 0 && rect.height > 0 && rect.top > MIN_Y && rect.top < MAX_Y;
+                        const candidates = Array.from(document.querySelectorAll("button, span, div, a, i"));
+
+                        for (const el of candidates) {
+                            const text = (el.innerText || "").trim();
+                            if (!/Launch|rocket_launch/i.test(text)) continue;
+
+                            let targetEl = el;
+                            let rect = targetEl.getBoundingClientRect();
+                            let parentDepth = 0;
+                            while (parentDepth < 3 && targetEl.parentElement) {
+                                if (targetEl.tagName === "BUTTON" || targetEl.getAttribute("role") === "button") break;
+                                const parent = targetEl.parentElement;
+                                const parentRect = parent.getBoundingClientRect();
+                                if (isValid(parentRect)) {
+                                    targetEl = parent;
+                                    rect = parentRect;
+                                }
+                                parentDepth++;
+                            }
+
+                            if (isValid(rect)) {
+                                return {
+                                    found: true,
+                                    tagName: targetEl.tagName,
+                                    text: text.substring(0, 15),
+                                    x: rect.left + rect.width / 2,
+                                    y: rect.top + rect.height / 2,
+                                };
+                            }
+                        }
+                        return { found: false };
+                    });
+
+                    if (targetInfo.found) {
+                        this.logger.info(
+                            `[Context#${authIndex}] 🎯 Found Rocket/Launch button [${targetInfo.tagName}], engaging...`
+                        );
+                        await page.mouse.move(targetInfo.x, targetInfo.y, { steps: 5 });
+                        await this._sleepBackgroundWakeup(state, 300);
+                        await page.mouse.down();
+                        await this._sleepBackgroundWakeup(state, 400);
+                        await page.mouse.up();
+                        await this._sleepBackgroundWakeup(state, 1500);
+
+                        if (!isPageAlive()) break;
+                        const isStillThere = await page.evaluate(() => {
+                            const els = Array.from(document.querySelectorAll('button, span, div[role="button"]'));
+                            return els.some(el => {
+                                const rect = el.getBoundingClientRect();
+                                return (
+                                    /Launch|rocket_launch/i.test(el.innerText) &&
+                                    rect.top > 400 &&
+                                    rect.top < 800 &&
+                                    rect.height > 0
+                                );
+                            });
+                        });
+
+                        if (isStillThere) {
+                            this.logger.warn(
+                                `[Context#${authIndex}] ⚠️ Physical click ineffective, attempting JS force click...`
+                            );
+                            await page.evaluate(() => {
+                                const candidates = Array.from(
+                                    document.querySelectorAll('button, span, div[role="button"]')
+                                );
+                                for (const el of candidates) {
+                                    const rect = el.getBoundingClientRect();
+                                    if (
+                                        /Launch|rocket_launch/i.test(el.innerText) &&
+                                        rect.top > 400 &&
+                                        rect.top < 800
+                                    ) {
+                                        (el.closest("button") || el).click();
+                                        return true;
+                                    }
+                                }
+                                return false;
+                            });
+                            await this._sleepBackgroundWakeup(state, 2000);
+                        } else {
+                            this.logger.info(`[Context#${authIndex}] ✅ Click successful, button disappeared.`);
+                            for (let i = 0; i < 60 && isPageAlive(); i++) {
+                                if (state.noButtonCount === 0) break;
+                                await this._sleepBackgroundWakeup(state, 1000);
+                            }
+                        }
+                    } else {
+                        state.noButtonCount++;
+                        this._syncBackgroundWakeupLegacyState(authIndex);
+                        if (state.noButtonCount > 20) {
+                            for (let i = 0; i < 30 && isPageAlive(); i++) {
+                                if (state.noButtonCount === 0) break;
+                                await this._sleepBackgroundWakeup(state, 1000);
+                            }
+                        } else {
+                            await this._sleepBackgroundWakeup(state, 1500);
+                        }
+                    }
+                } catch (error) {
+                    await this._sleepBackgroundWakeup(state, 1000);
+                }
+            }
+        } finally {
+            state.running = false;
+            if (state.timer) clearTimeout(state.timer);
+            if (this.backgroundWakeups.get(authIndex) === state) this.backgroundWakeups.delete(authIndex);
+            this._syncBackgroundWakeupLegacyState();
+            if (state.resolveDone) state.resolveDone();
+            this.logger.debug(`[Context#${authIndex}] BackgroundWakeup worker exited.`);
+        }
+    }
     async launchBrowserForVNC(extraArgs = {}) {
         const stickyProxy = this.stickyProxyManager.reserveProxyForNewAccount("VNC account binding");
         this.logger.info("🚀 [VNC] Launching a new, separate, headful browser instance for VNC session...");
@@ -2193,6 +2231,10 @@ class BrowserManager {
                     healthMonitorInterval: null,
                     page,
                 });
+                // Keep every logged-in account warm, not only the account currently
+                // selected by the legacy UI/recovery pointer.
+                this._startHealthMonitor(authIndex);
+                this._startBackgroundWakeup(authIndex);
             } else {
                 this._throwIfContextInitAborted(authIndex, isBackgroundTask);
             }
@@ -2327,15 +2369,6 @@ class BrowserManager {
                             // Note: rebalanceContextPool() will be called by the caller (AuthSwitcher)
                         }
 
-                        // Stop background tasks for old context
-                        if (this._currentAuthIndex >= 0 && this.contexts.has(this._currentAuthIndex)) {
-                            const oldContextData = this.contexts.get(this._currentAuthIndex);
-                            if (oldContextData.healthMonitorInterval) {
-                                clearInterval(oldContextData.healthMonitorInterval);
-                                oldContextData.healthMonitorInterval = null;
-                            }
-                        }
-
                         // Switch to new context
                         this._activateContext(contextData.context, contextData.page, authIndex);
                         await this._flushPendingContextClosures();
@@ -2381,15 +2414,6 @@ class BrowserManager {
         this.initializingContexts.add(authIndex);
 
         try {
-            // Stop background tasks for old context
-            if (this._currentAuthIndex >= 0 && this.contexts.has(this._currentAuthIndex)) {
-                const oldContextData = this.contexts.get(this._currentAuthIndex);
-                if (oldContextData.healthMonitorInterval) {
-                    clearInterval(oldContextData.healthMonitorInterval);
-                    oldContextData.healthMonitorInterval = null;
-                }
-            }
-
             // Initialize new context (isBackgroundTask=false for foreground initialization)
             const { context, page } = await this._initializeContext(authIndex, false);
 
@@ -2487,15 +2511,15 @@ class BrowserManager {
         this.logger.info(`🔄 [Reconnect] Starting lightweight reconnect for account #${targetAuthIndex}...`);
         this.logger.info("==================================================");
 
-        // Stop existing background tasks only if this is the current account
+        // Stop only this account's wakeup worker before navigating it. Other
+        // account workers continue operating on their own pages.
         const isCurrentAccount = targetAuthIndex === this._currentAuthIndex;
-        if (isCurrentAccount) {
-            const ctxData = this.contexts.get(targetAuthIndex);
-            if (ctxData && ctxData.healthMonitorInterval) {
-                clearInterval(ctxData.healthMonitorInterval);
-                ctxData.healthMonitorInterval = null;
-                this.logger.info("[Reconnect] Stopped background health monitor.");
-            }
+        await this._stopBackgroundWakeup(targetAuthIndex, "reconnect");
+        const ctxData = this.contexts.get(targetAuthIndex);
+        if (ctxData && ctxData.healthMonitorInterval) {
+            clearInterval(ctxData.healthMonitorInterval);
+            ctxData.healthMonitorInterval = null;
+            this.logger.info(`[Reconnect#${targetAuthIndex}] Stopped background health monitor.`);
         }
 
         try {
@@ -2539,13 +2563,11 @@ class BrowserManager {
             this.logger.info(`✅ [Reconnect] Lightweight reconnect successful for account #${targetAuthIndex}!`);
             this.logger.info("==================================================");
 
-            // Restart background tasks only if this is the current account
-            if (isCurrentAccount) {
-                // Reset BackgroundWakeup state after reconnect
-                this.noButtonCount = 0;
-                this._startHealthMonitor();
-                this._startBackgroundWakeup(); // Internal check prevents duplicate instances
-            }
+            // Restart both per-account workers. The active-account pointer is
+            // only a UI/recovery concept and must not control other accounts.
+            if (isCurrentAccount) this.noButtonCount = 0;
+            this._startHealthMonitor(targetAuthIndex);
+            this._startBackgroundWakeup(targetAuthIndex);
 
             return true;
         } catch (error) {
@@ -2619,6 +2641,10 @@ class BrowserManager {
 
         const contextData = this.contexts.get(authIndex);
 
+        // Stop this account's Rocket/Launch worker before removing its page from
+        // the context pool. Other account workers remain untouched.
+        await this._stopBackgroundWakeup(authIndex, "context_closed");
+
         // Stop health monitor for this context
         if (contextData.healthMonitorInterval) {
             clearInterval(contextData.healthMonitorInterval);
@@ -2648,9 +2674,6 @@ class BrowserManager {
             this.context = null;
             this.page = null;
             this._currentAuthIndex = -1;
-            // DO NOT reset backgroundWakeupRunning here!
-            // If a BackgroundWakeup was running, it will detect this.page === null and exit on its own.
-            // Resetting the flag here could allow a new instance to start before the old one exits.
             this.logger.debug(`[Browser] Current context was closed, currentAuthIndex reset to -1.`);
         }
 
@@ -2678,6 +2701,13 @@ class BrowserManager {
      * Called when browser is closing or has disconnected
      */
     _cleanupAllContexts() {
+        for (const state of this.backgroundWakeups.values()) {
+            state.stopRequested = true;
+            if (state.wake) state.wake();
+        }
+        this.backgroundWakeups.clear();
+        this._syncBackgroundWakeupLegacyState();
+
         // Clean up all context health monitors
         for (const [authIndex, contextData] of this.contexts.entries()) {
             if (contextData.healthMonitorInterval) {
@@ -2696,9 +2726,6 @@ class BrowserManager {
         this.context = null;
         this.page = null;
         this._currentAuthIndex = -1;
-        // DO NOT reset backgroundWakeupRunning here!
-        // If a BackgroundWakeup was running, it will detect this.page === null and exit on its own.
-        // Resetting the flag here could allow a new instance to start before the old one exits.
     }
 
     /**

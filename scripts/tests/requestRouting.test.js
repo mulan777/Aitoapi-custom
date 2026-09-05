@@ -1,0 +1,114 @@
+const assert = require("assert");
+const RequestHandler = require("../../src/core/RequestHandler");
+
+const makeHandler = () => {
+    const connections = new Map([
+        [
+            0,
+            {
+                readyState: 1,
+                send(payload) {
+                    this.sent.push(payload);
+                },
+                sent: [],
+            },
+        ],
+        [
+            1,
+            {
+                readyState: 1,
+                send(payload) {
+                    this.sent.push(payload);
+                },
+                sent: [],
+            },
+        ],
+    ]);
+
+    const handler = Object.create(RequestHandler.prototype);
+    handler.connectionRegistry = {
+        getAllConnections: () => connections,
+        getConnectionByAuth: authIndex => connections.get(authIndex),
+    };
+    handler.logger = { debug() {}, info() {}, warn() {} };
+    handler.requestAuthBindings = new Map();
+    handler.requestRouteCursor = 0;
+    handler.requestFailureCounts = new Map();
+    handler.accountRouteState = new Map();
+    handler.config = {
+        accountCooldownMaxMs: 30000,
+        accountCooldownMs: 1000,
+        failureThreshold: 1,
+        immediateSwitchStatusCodes: [429, 503],
+    };
+    handler.authSwitcher = {
+        called: false,
+        currentAuthIndex: 0,
+        handleRequestFailureAndSwitch() {
+            this.called = true;
+            return { success: false };
+        },
+    };
+    return { connections, handler };
+};
+
+const testRoundRobinAndBinding = () => {
+    const { handler } = makeHandler();
+    assert.deepStrictEqual([handler._selectRequestAuthIndex(), handler._selectRequestAuthIndex()], [0, 1]);
+
+    handler._bindRequestAuthIndex("request-1", 0);
+    handler.authSwitcher.currentAuthIndex = 1;
+    assert.strictEqual(handler._getRequestAuthIndex("request-1"), 0);
+    handler._releaseRequestAuthIndex("request-1");
+    assert.strictEqual(handler._getRequestAuthIndex("request-1"), 1);
+};
+
+const testFailureDoesNotGloballySwitch = async () => {
+    const { handler } = makeHandler();
+    handler._bindRequestAuthIndex("request-2", 0);
+    const result = await handler._handleRequestFailureScoped({ message: "busy", status: 429 }, "request-2");
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(handler._getRequestAuthIndex("request-2"), 1);
+    assert.strictEqual(handler.authSwitcher.called, false);
+    assert.ok(handler.getAccountRouteStatus(0).cooldownUntil);
+    assert.strictEqual(handler._selectRequestAuthIndex(), 1);
+};
+
+const testLeastLoadedTieBreak = () => {
+    const { handler } = makeHandler();
+    handler._bindRequestAuthIndex("long-stream", 0);
+    assert.strictEqual(handler._selectRequestAuthIndex(), 1);
+};
+
+const test429QuarantinesAccount = () => {
+    const { handler } = makeHandler();
+    handler._markAccount429(0, { message: "rate limited", status: 429 });
+    handler._markAccount429(1, { message: "rate limited", status: 429 });
+    assert.strictEqual(handler._selectRequestAuthIndex(), -1);
+    assert.ok(handler.getNextCooldownMs() > 0);
+    return handler._handleRequestFailureScoped({ message: "rate limited", status: 429 }, "request-4").then(result => {
+        assert.strictEqual(result.rateLimited, true);
+        assert.strictEqual(handler.authSwitcher.called, false);
+    });
+};
+
+const testForwardUsesSelectedAccount = () => {
+    const { handler, connections } = makeHandler();
+    handler._forwardRequest({ request_attempt_id: "attempt-1", request_id: "request-3" }, 1);
+    assert.strictEqual(connections.get(0).sent.length, 0);
+    assert.strictEqual(connections.get(1).sent.length, 1);
+    assert.strictEqual(JSON.parse(connections.get(1).sent[0]).request_id, "request-3");
+};
+
+(async () => {
+    testRoundRobinAndBinding();
+    await testFailureDoesNotGloballySwitch();
+    testLeastLoadedTieBreak();
+    await test429QuarantinesAccount();
+    testForwardUsesSelectedAccount();
+    console.log("request routing tests: PASS");
+})().catch(error => {
+    console.error(error.stack || error.message);
+    process.exitCode = 1;
+});

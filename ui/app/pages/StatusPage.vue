@@ -833,9 +833,36 @@
                                         <span v-if="item.isExpired" class="expired-badge">
                                             {{ t("tagExpired") }}
                                         </span>
+                                        <span v-if="item.route?.cooldownUntil" class="expired-badge">
+                                            {{ t("accountCooldown") }}
+                                        </span>
+                                        <span v-else-if="item.route?.inFlight > 0" class="current-badge">
+                                            {{ t("accountInFlight") }}: {{ item.route.inFlight }}
+                                        </span>
                                     </div>
                                 </el-tooltip>
                                 <div class="account-actions">
+                                    <button
+                                        class="btn-test"
+                                        :disabled="isBusy || state.testingAccountIndex === item.index"
+                                        :title="t('testAccount')"
+                                        @click.stop="testAccountByIndex(item.index)"
+                                    >
+                                        <svg
+                                            xmlns="http://www.w3.org/2000/svg"
+                                            width="16"
+                                            height="16"
+                                            viewBox="0 0 24 24"
+                                            fill="none"
+                                            stroke="currentColor"
+                                            stroke-width="2"
+                                            stroke-linecap="round"
+                                            stroke-linejoin="round"
+                                        >
+                                            <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path>
+                                            <polyline points="22 4 12 14.01 9 11.01"></polyline>
+                                        </svg>
+                                    </button>
                                     <button
                                         class="btn-switch"
                                         :class="{
@@ -3724,9 +3751,12 @@ const state = reactive({
     maxRetries: 3,
     releaseUrl: null,
     safetySettingsThreshold: "OFF",
-    selectedAccounts: new Set(), // Selected account indices
+    selectedAccounts: new Set(),
     serviceConnected: false,
+
     streamingModeReal: false,
+    // Selected account indices
+    testingAccountIndex: -1,
     // theme: handled by useTheme
     usageCount: 0,
 });
@@ -4410,6 +4440,22 @@ const switchAccountByIndex = targetIndex => {
                 console.error(e);
             }
         });
+};
+
+const testAccountByIndex = async targetIndex => {
+    if (state.testingAccountIndex >= 0) return;
+    state.testingAccountIndex = targetIndex;
+    try {
+        const res = await fetch(`/api/accounts/${targetIndex}/test`, { method: "POST" });
+        const data = await res.json();
+        if (!res.ok || !data.success) throw new Error(data.message || `HTTP ${res.status}`);
+        ElMessage.success(t("testAccountSuccess"));
+    } catch (error) {
+        ElMessage.error(t("testAccountFailed").replace("{error}", error.message));
+    } finally {
+        state.testingAccountIndex = -1;
+        await updateContent();
+    }
 };
 
 const copyText = async text => {
