@@ -112,6 +112,44 @@ const testModelNormalization = () => {
     assert.strictEqual(handler._normalizeRouteModel("/gemini-3.7-flash(high)"), "gemini-3.7-flash");
 };
 
+
+const testModel429HelperQuarantinesOnlyModel = () => {
+    const { handler } = makeHandler();
+    handler._markImmediateRateLimitIfNeeded(
+        0,
+        "gemini-3.8-flash",
+        { message: "quota", status: 429 }
+    );
+    assert.strictEqual(
+        handler._selectRequestAuthIndex([1], "gemini-3.8-flash"),
+        -1
+    );
+    assert.strictEqual(
+        handler._selectRequestAuthIndex([1], "gemini-3.7-flash"),
+        0
+    );
+};
+
+const testSuccessResetsTransientFailureState = () => {
+    const { handler } = makeHandler();
+    handler.requestFailureCounts.set(0, 2);
+    handler.authSwitcher.failureCount = 2;
+    handler._markAccountSuccess(0, "gemini-3.8-flash");
+    assert.strictEqual(handler.requestFailureCounts.has(0), false);
+    assert.strictEqual(handler.authSwitcher.failureCount, 0);
+};
+
+const testExpiredAndRemovedAccountsAreNotRouted = () => {
+    const { handler } = makeHandler();
+    handler.authSource = {
+        availableIndices: [0, 1],
+        isExpired: index => index === 1,
+    };
+    assert.strictEqual(handler._selectRequestAuthIndex(), 0);
+    handler.authSource.availableIndices = [1];
+    assert.strictEqual(handler._selectRequestAuthIndex(), -1);
+};
+
 const testForwardUsesSelectedAccount = () => {
     const { handler, connections } = makeHandler();
     handler._forwardRequest({ request_attempt_id: "attempt-1", request_id: "request-3" }, 1);
@@ -220,6 +258,9 @@ const testPerAccountUsageRotation = async () => {
     testLeastLoadedTieBreak();
     await test429QuarantinesAccount();
     test429IsScopedToModel();
+    testModel429HelperQuarantinesOnlyModel();
+    testSuccessResetsTransientFailureState();
+    testExpiredAndRemovedAccountsAreNotRouted();
     testModelNormalization();
     testForwardUsesSelectedAccount();
     await testAccountTestPreservesActiveCooldown();
