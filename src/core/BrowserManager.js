@@ -53,6 +53,12 @@ class BrowserManager {
         this.abortedContexts = new Set(); // Indices that should be aborted during background init
         this._backgroundPreloadTask = null; // Current background preload task promise (only one at a time)
         this._backgroundPreloadAbort = false; // Flag to signal background task to abort
+        // Foreground standby/replacement mutations are serialized. This avoids
+        // concurrent 429 retries aborting each other's preload/cleanup work.
+        this._contextInitPromises = new Map();
+        this._contextPoolMutationTail = Promise.resolve();
+        this._rebalancePromise = null;
+        this._rebalanceRequested = false;
 
         // Legacy single context references (for backward compatibility)
         this.context = null;
@@ -928,7 +934,14 @@ class BrowserManager {
         }
 
         if (pageTitle.includes("403") || pageTitle.includes("Forbidden")) {
-            throw new Error("🚨 403 Forbidden: Current IP reputation too low, access denied by Google risk control.");
+            if (authIndex >= 0 && this.authSource?.disableAuth && this.config?.autoDisableStatusCodes?.includes(403)) {
+                await this.authSource.disableAuth(authIndex, { reason: "forbidden", status: 403 });
+            }
+            const error = new Error(
+                "🚨 403 Forbidden: Account does not have permission to access the upstream service."
+            );
+            error.status = 403;
+            throw error;
         }
 
         if (currentUrl === "about:blank") {
@@ -1749,43 +1762,21 @@ class BrowserManager {
                 break;
             }
 
-            // Check if browser is available, launch if needed
-            if (!this.browser) {
-                this.logger.info(`[ContextPool] Browser not available, launching browser for background preload...`);
-                try {
-                    await this._ensureBrowser();
-                    this.logger.info(`[ContextPool] Browser launched successfully for background preload`);
-                } catch (error) {
-                    this.logger.error(
-                        `[ContextPool] Failed to launch browser for background preload: ${error.message}`
-                    );
+            try {
+                // Reservation is synchronous inside _ensureContextForAuthUnlocked;
+                // do not hold the pool mutex across a potentially 120-second
+                // browser/WebSocket initialization.
+                if (maxPoolSize > 0 && this.contexts.size + this.initializingContexts.size >= maxPoolSize) {
                     break;
                 }
-            }
-
-            // Check pool size limit
-            if (maxPoolSize > 0 && this.contexts.size >= maxPoolSize) {
-                this.logger.info(`[ContextPool] Pool size limit reached, stopping preload`);
-                break;
-            }
-
-            // Skip if already exists or being initialized by another task
-            if (this.contexts.has(authIndex)) {
-                this.logger.debug(`[ContextPool] Context #${authIndex} already exists, skipping`);
-                continue;
-            }
-            if (this.initializingContexts.has(authIndex)) {
-                this.logger.info(
-                    `[ContextPool] Context #${authIndex} already being initialized by another task, skipping`
-                );
-                continue;
-            }
-
-            this.initializingContexts.add(authIndex);
-            try {
+                if (this.contexts.has(authIndex) || this.initializingContexts.has(authIndex)) continue;
+                if (this.authSource?.isUnavailable?.(authIndex)) continue;
                 this.logger.info(`[ContextPool] Background preload init context #${authIndex}...`);
-                await this._initializeContext(authIndex, true); // Mark as background task
-                this.logger.info(`✅ [ContextPool] Background context #${authIndex} ready.`);
+                const ready = await this._ensureContextForAuthUnlocked(authIndex, {
+                    allowTemporaryOverflow: false,
+                    isBackgroundTask: true,
+                });
+                if (ready) this.logger.info(`✅ [ContextPool] Background context #${authIndex} ready.`);
             } catch (error) {
                 // Check if this is an abort error (user deleted the account during initialization or background preload was aborted)
                 const isAbortError = isContextAbortedError(error);
@@ -1982,29 +1973,82 @@ class BrowserManager {
      * This is used when every currently warm context is out of quota for the
      * requested model but the auth pool still contains standby accounts.
      */
-    async ensureContextForAuth(authIndex) {
-        if (!Number.isInteger(authIndex) || authIndex < 0) return false;
-        if (this.contexts.has(authIndex)) return true;
-        if (this.initializingContexts.has(authIndex)) {
-            await this._waitForContextInit(authIndex);
-            return this.contexts.has(authIndex);
+    async _withContextPoolMutation(task) {
+        if (!this._contextPoolMutationTail || typeof this._contextPoolMutationTail.catch !== "function") {
+            this._contextPoolMutationTail = Promise.resolve();
         }
-
-        await this.preCleanupForSwitch(authIndex);
-        const maxContexts = this.config.maxContexts;
-        if (maxContexts > 0 && this.contexts.size + this.initializingContexts.size >= maxContexts) {
-            return false;
-        }
-        if (!this.browser) await this._ensureBrowser();
-
-        this.initializingContexts.add(authIndex);
+        const previous = this._contextPoolMutationTail;
+        let release;
+        this._contextPoolMutationTail = new Promise(resolve => {
+            release = resolve;
+        });
+        await previous.catch(() => {});
         try {
-            await this._initializeContext(authIndex, true);
-            return this.contexts.has(authIndex);
-        } catch (error) {
-            this.logger.warn(`[ContextPool] Standby account #${authIndex} warm-up failed: ${error.message}`);
-            return false;
+            return await task();
+        } finally {
+            release();
         }
+    }
+
+    async _ensureContextForAuthUnlocked(authIndex, options = {}) {
+        if (!Number.isInteger(authIndex) || authIndex < 0) return false;
+        if (this.authSource?.isUnavailable?.(authIndex)) return false;
+        if (this.contexts.has(authIndex)) return true;
+        if (this._contextInitPromises.has(authIndex)) return this._contextInitPromises.get(authIndex);
+
+        if (this.contexts.has(authIndex)) return true;
+        const maxContexts = this.config.maxContexts;
+        const occupancy = this.contexts.size + this.initializingContexts.size;
+        if (maxContexts > 0 && occupancy >= maxContexts && options.allowTemporaryOverflow !== true) return false;
+        // Reserve the slot before the first await. This makes the occupancy
+        // check atomic from JavaScript's event-loop perspective while keeping
+        // the expensive browser startup outside the pool mutex.
+        this.initializingContexts.add(authIndex);
+
+        const operation = (async () => {
+            try {
+                if (!this.browser) await this._ensureBrowser();
+                await this._initializeContext(authIndex, options.isBackgroundTask === true);
+                return this.contexts.has(authIndex);
+            } catch (error) {
+                this.logger.warn(`[ContextPool] Standby account #${authIndex} warm-up failed: ${error.message}`);
+                this.initializingContexts.delete(authIndex);
+                return false;
+            }
+        })();
+        this._contextInitPromises.set(authIndex, operation);
+        try {
+            return await operation;
+        } finally {
+            if (this._contextInitPromises.get(authIndex) === operation) this._contextInitPromises.delete(authIndex);
+        }
+    }
+
+    async ensureContextForAuth(authIndex, options = {}) {
+        return this._ensureContextForAuthUnlocked(authIndex, options);
+    }
+
+    async replaceContextForAuth(sourceAuthIndex, targetAuthIndex, options = {}) {
+        return this._withContextPoolMutation(async () => {
+            if (sourceAuthIndex === targetAuthIndex) return this.contexts.has(targetAuthIndex);
+            const ready = await this.ensureContextForAuth(targetAuthIndex, { allowTemporaryOverflow: true });
+            if (!ready) return false;
+            if (!this.contexts.has(targetAuthIndex)) return false;
+            if (options.activateTarget === true && this.contexts.has(targetAuthIndex)) {
+                const target = this.contexts.get(targetAuthIndex);
+                this._activateContext(target.context, target.page, targetAuthIndex);
+            }
+            if (this.contexts.has(sourceAuthIndex)) {
+                await this._closeContextForPoolIfPossible(
+                    sourceAuthIndex,
+                    options.reason || "atomic_context_replacement"
+                );
+            }
+            this.logger.info(
+                `[ContextPool] Atomic replacement ready: source #${sourceAuthIndex} -> target #${targetAuthIndex}.`
+            );
+            return true;
+        });
     }
 
     /**
@@ -2012,6 +2056,37 @@ class BrowserManager {
      * Removes excess contexts and starts missing ones in background
      */
     async rebalanceContextPool() {
+        if (this._rebalancePromise) {
+            this._rebalanceRequested = true;
+            return this._rebalancePromise;
+        }
+
+        const operation = (async () => {
+            // Abort outside the pool mutex. A preload worker may itself be
+            // waiting for that mutex; aborting it while holding the mutex
+            // deadlocks the browser pool.
+            await this.abortBackgroundPreload();
+            const result = await this._withContextPoolMutation(() => this._rebalanceContextPoolOnce());
+            if (result?.candidates?.length > 0) {
+                await this._preloadBackgroundContexts(result.candidates, result.maxPoolSize);
+            }
+            return result;
+        })();
+        this._rebalancePromise = operation;
+        try {
+            return await operation;
+        } finally {
+            if (this._rebalancePromise === operation) this._rebalancePromise = null;
+            if (this._rebalanceRequested) {
+                this._rebalanceRequested = false;
+                this.rebalanceContextPool().catch(error => {
+                    this.logger.error(`[ContextPool] Coalesced rebalance failed: ${error.message}`);
+                });
+            }
+        }
+    }
+
+    async _rebalanceContextPoolOnce() {
         const maxContexts = this.config.maxContexts;
         // maxContexts === 0 means unlimited pool size
         const isUnlimited = maxContexts === 0;
@@ -2031,7 +2106,9 @@ class BrowserManager {
         let targets;
         if (isUnlimited) {
             // Filter out expired accounts from availableIndices
-            const nonExpiredAvailable = this.authSource.availableIndices.filter(idx => !this.authSource.isExpired(idx));
+            const nonExpiredAvailable = this.authSource.availableIndices.filter(
+                idx => !this.authSource.isUnavailable?.(idx)
+            );
             targets = new Set(nonExpiredAvailable);
         } else {
             targets = new Set(ordered.slice(0, maxContexts));
@@ -2098,9 +2175,10 @@ class BrowserManager {
 
         // Preload candidates if ready and initializing contexts still leave room in the pool
         const poolOccupancy = this.contexts.size + this.initializingContexts.size;
-        if (candidates.length > 0 && (isUnlimited || poolOccupancy < maxContexts)) {
-            this._preloadBackgroundContexts(candidates, isUnlimited ? 0 : maxContexts);
-        }
+        return {
+            candidates: candidates.length > 0 && (isUnlimited || poolOccupancy < maxContexts) ? candidates : [],
+            maxPoolSize: isUnlimited ? 0 : maxContexts,
+        };
     }
 
     /**
@@ -2349,6 +2427,9 @@ class BrowserManager {
             this.logger.error(`[Browser] Invalid authIndex: ${authIndex}. authIndex must be >= 0.`);
             this._currentAuthIndex = -1;
             throw new Error(`Invalid authIndex: ${authIndex}. Must be >= 0.`);
+        }
+        if (this.authSource?.isUnavailable?.(authIndex)) {
+            throw new Error(`Account #${authIndex} is disabled or expired.`);
         }
 
         this._cancelPendingContextClosure(authIndex, "context_reused");

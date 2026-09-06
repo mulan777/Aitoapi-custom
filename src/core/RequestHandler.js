@@ -9,6 +9,8 @@
  * Request Handler Module (Refactored)
  * Main request handler that coordinates between other modules
  */
+const fs = require("fs");
+const path = require("path");
 const AuthSwitcher = require("../auth/AuthSwitcher");
 const FormatConverter = require("./FormatConverter");
 const { isUserAbortedError } = require("../utils/CustomErrors");
@@ -46,6 +48,13 @@ class RequestHandler {
         this.requestRouteCursor = 0;
         this.requestFailureCounts = new Map();
         this.accountRouteState = new Map();
+        this.accountRouteStatePath = path.join(process.cwd(), "data", "account-route-state.json");
+        this.accountRouteStateWrite = Promise.resolve();
+        this._loadAccountRouteState();
+        // A single upstream 401/403 can be observed by several retry paths at
+        // once. Keep account shutdown/rebalance single-flight per credential;
+        // otherwise every observer can close and relaunch the browser again.
+        this.accountDisableCleanup = new Map();
         this.pendingUsageRotations = new Set();
         this.usageRotationPromise = null;
         this.usageRotationRetryTimer = null;
@@ -55,6 +64,68 @@ class RequestHandler {
             FAKE_STREAM: this.config.fakeStreamTimeoutMs || DEFAULT_TIMEOUTS.FAKE_STREAM,
             STREAM_CHUNK: this.config.streamTimeoutMs || DEFAULT_TIMEOUTS.STREAM_CHUNK,
         };
+    }
+
+    _loadAccountRouteState() {
+        try {
+            if (!fs.existsSync(this.accountRouteStatePath)) return;
+            const raw = JSON.parse(fs.readFileSync(this.accountRouteStatePath, "utf-8"));
+            const now = Date.now();
+            for (const [indexValue, saved] of Object.entries(raw?.accounts || {})) {
+                const authIndex = Number(indexValue);
+                if (!Number.isInteger(authIndex) || authIndex < 0 || !saved || typeof saved !== "object") continue;
+                const modelCooldowns = Object.fromEntries(
+                    Object.entries(saved.modelCooldowns || {}).filter(([, until]) => Number(until) > now)
+                );
+                this.accountRouteState.set(authIndex, {
+                    cooldownUntil: Number(saved.cooldownUntil) > now ? Number(saved.cooldownUntil) : 0,
+                    inFlight: 0,
+                    lastError: saved.lastError || null,
+                    lastStatus: Number.isFinite(Number(saved.lastStatus)) ? Number(saved.lastStatus) : null,
+                    modelCooldowns,
+                    modelRateLimitHits: saved.modelRateLimitHits || {},
+                    rateLimitHits: Number(saved.rateLimitHits) || 0,
+                    usageCount: 0,
+                    usageExhausted: false,
+                    usageExhaustedAt: 0,
+                });
+            }
+            this.logger.info(`[Routing] Restored model cooldown state for ${this.accountRouteState.size} account(s).`);
+        } catch (error) {
+            this.logger.warn(`[Routing] Ignoring invalid persisted cooldown state: ${error.message}`);
+        }
+    }
+
+    _persistAccountRouteState() {
+        if (!this.accountRouteStatePath) return;
+        const accounts = {};
+        for (const [authIndex, state] of this.accountRouteState.entries()) {
+            accounts[String(authIndex)] = {
+                cooldownUntil: state.cooldownUntil || 0,
+                lastError: state.lastError || null,
+                lastStatus: state.lastStatus || null,
+                modelCooldowns: state.modelCooldowns || {},
+                modelRateLimitHits: state.modelRateLimitHits || {},
+                rateLimitHits: state.rateLimitHits || 0,
+            };
+        }
+        const target = this.accountRouteStatePath;
+        const temporary = `${target}.tmp`;
+        this.accountRouteStateWrite = this.accountRouteStateWrite
+            .catch(() => {})
+            .then(async () => {
+                await fs.promises.mkdir(path.dirname(target), { recursive: true });
+                await fs.promises.writeFile(temporary, `${JSON.stringify({ accounts }, null, 2)}\n`, "utf-8");
+                await fs.promises.rm(target, { force: true });
+                await fs.promises.rename(temporary, target);
+            })
+            .catch(error => this.logger.warn(`[Routing] Failed to persist cooldown state: ${error.message}`));
+    }
+
+    _isAuthUnavailable(authIndex) {
+        if (this.accountDisableCleanup?.has(authIndex)) return true;
+        if (typeof this.authSource?.isUnavailable === "function") return this.authSource.isUnavailable(authIndex);
+        return Boolean(this.authSource?.isExpired?.(authIndex));
     }
 
     _normalizeRouteModel(modelName) {
@@ -90,25 +161,32 @@ class RequestHandler {
         const routeModel = this._normalizeRouteModel(modelName);
         if (!routeModel || !this.browserManager?.ensureContextForAuth) return false;
         const excludedSet = new Set(excluded);
-        const candidates = (this.authSource?.getRotationIndices?.() || this.authSource?.availableIndices || [])
+        const candidate = (this.authSource?.getRotationIndices?.() || this.authSource?.availableIndices || [])
             .filter(index => !excludedSet.has(index) && !this.browserManager.contexts.has(index))
-            .filter(index => !this.authSource?.isExpired?.(index));
+            .filter(index => !this._isAuthUnavailable(index))
+            .find(index => {
+                const state = this._getAccountRouteState(index);
+                return (
+                    state.cooldownUntil <= Date.now() &&
+                    !state.usageExhausted &&
+                    (state.modelCooldowns?.[routeModel] || 0) <= Date.now()
+                );
+            });
+        if (!Number.isInteger(candidate)) return false;
 
-        for (const authIndex of candidates) {
-            const state = this._getAccountRouteState(authIndex);
-            if (
-                state.cooldownUntil > Date.now() ||
-                state.usageExhausted ||
-                (state.modelCooldowns?.[routeModel] || 0) > Date.now()
-            ) {
-                continue;
-            }
-            if (await this.browserManager.ensureContextForAuth(authIndex)) {
-                this.logger.info(`[Routing] Warmed standby account #${authIndex} for model "${routeModel}".`);
-                return true;
-            }
-        }
-        return false;
+        const sourceAuthIndex = excluded.find(index => this.browserManager.contexts.has(index));
+        // In unlimited mode, a model 429 only changes routing eligibility;
+        // do not close the source context just to make room for a standby.
+        const warmed =
+            this.config.maxContexts === 0 ||
+            !Number.isInteger(sourceAuthIndex) ||
+            !this.browserManager.replaceContextForAuth
+                ? await this.browserManager.ensureContextForAuth(candidate)
+                : await this.browserManager.replaceContextForAuth(sourceAuthIndex, candidate, {
+                      reason: `model_429_${routeModel}`,
+                  });
+        if (warmed) this.logger.info(`[Routing] Warmed one standby account #${candidate} for model "${routeModel}".`);
+        return warmed;
     }
 
     _selectRequestAuthIndex(excluded = [], modelName = null) {
@@ -126,7 +204,7 @@ class RequestHandler {
                 ) {
                     return false;
                 }
-                if (this.authSource?.isExpired?.(authIndex)) return false;
+                if (this._isAuthUnavailable(authIndex)) return false;
                 const routeState = this.accountRouteState.get(authIndex);
                 if (routeState?.cooldownUntil > now) return false;
                 if (this._isPerAccountUsageRoutingEnabled() && routeState?.usageExhausted) return false;
@@ -144,7 +222,7 @@ class RequestHandler {
                 !excludedSet.has(current) &&
                 (!Array.isArray(this.authSource?.availableIndices) ||
                     this.authSource.availableIndices.includes(current)) &&
-                !this.authSource?.isExpired?.(current) &&
+                !this._isAuthUnavailable(current) &&
                 currentConnection &&
                 currentConnection.readyState === 1 &&
                 (!currentState?.cooldownUntil || currentState.cooldownUntil <= now) &&
@@ -264,7 +342,7 @@ class RequestHandler {
             if (seen.has(authIndex) || authIndex === sourceAuthIndex) continue;
             seen.add(authIndex);
 
-            if (this.authSource?.isExpired?.(authIndex)) continue;
+            if (this._isAuthUnavailable(authIndex)) continue;
             const state = this._getAccountRouteState(authIndex);
             if (state.cooldownUntil > now || state.usageExhausted) continue;
             candidates.push(authIndex);
@@ -304,6 +382,21 @@ class RequestHandler {
             candidates = this._getUsageRotationCandidates(sourceAuthIndex);
         }
         if (candidates.length === 0) {
+            // There may be only one usable account, or every replacement may
+            // still be warming. Do not turn a configured usage threshold into
+            // a permanent 503 when the source connection is still healthy.
+            const sourceConnection = this.connectionRegistry.getConnectionByAuth(sourceAuthIndex, false);
+            if (!this._isAuthUnavailable(sourceAuthIndex) && sourceConnection && sourceConnection.readyState === 1) {
+                sourceState.usageCount = 0;
+                sourceState.usageExhausted = false;
+                sourceState.usageExhaustedAt = 0;
+                this.pendingUsageRotations.delete(sourceAuthIndex);
+                this.logger.warn(
+                    `[Routing] No replacement account is ready for #${sourceAuthIndex}; ` +
+                        `resetting its usage cycle and continuing on the healthy connection.`
+                );
+                return true;
+            }
             this.logger.warn(
                 `[Routing] No replacement account is available for exhausted account #${sourceAuthIndex}.`
             );
@@ -311,6 +404,24 @@ class RequestHandler {
         }
 
         const hasContext = authIndex => this.browserManager?.contexts?.has(authIndex);
+
+        if (this.config.maxContexts === 0) {
+            const targetAuthIndex = candidates.find(authIndex => hasContext(authIndex)) || candidates[0];
+            const ready = hasContext(targetAuthIndex)
+                ? true
+                : await this.browserManager.ensureContextForAuth(targetAuthIndex);
+            if (!ready) return false;
+            if (wasCurrent && this.browserManager?.launchOrSwitchContext) {
+                await this.browserManager.launchOrSwitchContext(targetAuthIndex);
+            }
+            this.pendingUsageRotations.delete(sourceAuthIndex);
+            this.logger.info(
+                `[Routing] Unlimited context mode routed exhausted account #${sourceAuthIndex} to #${targetAuthIndex}; ` +
+                    `source context remains warm.`
+            );
+            return true;
+        }
+
         const coldCandidates = candidates.filter(authIndex => !hasContext(authIndex));
         const activeCandidates = candidates.filter(authIndex =>
             this.connectionRegistry.getConnectionByAuth(authIndex, false)
@@ -318,13 +429,6 @@ class RequestHandler {
         const orderedCandidates = [...coldCandidates, ...activeCandidates, ...candidates].filter(
             (authIndex, index, list) => list.indexOf(authIndex) === index
         );
-
-        // Free the exhausted slot first.  The request binding has already been
-        // released by the caller, so closeContext will not interrupt the
-        // request that caused the threshold to be reached.
-        if (this.browserManager?.contexts?.has(sourceAuthIndex)) {
-            await this.browserManager.closeContext(sourceAuthIndex);
-        }
 
         const activateIfNeeded = async targetAuthIndex => {
             if (!wasCurrent || !this.browserManager?.launchOrSwitchContext) return true;
@@ -340,22 +444,15 @@ class RequestHandler {
         };
 
         for (const targetAuthIndex of orderedCandidates) {
-            if (this.browserManager?.contexts?.has(targetAuthIndex)) {
-                if (await activateIfNeeded(targetAuthIndex)) {
-                    this.logger.info(
-                        `[Routing] Replaced exhausted account #${sourceAuthIndex} with warm account #${targetAuthIndex}.`
-                    );
-                    return true;
-                }
-                continue;
-            }
-
-            if (this.browserManager?.ensureContextForAuth) {
-                const warmed = await this.browserManager.ensureContextForAuth(targetAuthIndex);
-                if (warmed && (await activateIfNeeded(targetAuthIndex))) {
+            if (this.browserManager?.replaceContextForAuth) {
+                const replaced = await this.browserManager.replaceContextForAuth(sourceAuthIndex, targetAuthIndex, {
+                    activateTarget: wasCurrent,
+                    reason: "usage_threshold_rotation",
+                });
+                if (replaced && (await activateIfNeeded(targetAuthIndex))) {
                     this.logger.info(
                         `[Routing] Replaced exhausted account #${sourceAuthIndex} with account #${targetAuthIndex}; ` +
-                            `context warmed and WebSocket connected.`
+                            `target was ready before the old slot was closed.`
                     );
                     return true;
                 }
@@ -446,6 +543,7 @@ class RequestHandler {
         this.logger.warn(
             `[Routing] Account #${authIndex} entered ${routeModel ? `model "${routeModel}" ` : ""}429 cooldown for ${Math.ceil(cooldownMs / 1000)}s; matching requests will skip it.`
         );
+        this._persistAccountRouteState();
     }
 
     _markAccountSuccess(authIndex, modelName = null) {
@@ -458,11 +556,13 @@ class RequestHandler {
             state.modelRateLimitHits[routeModel] = 0;
             if (state.modelCooldowns[routeModel] <= Date.now()) {
                 delete state.modelCooldowns[routeModel];
+                this._persistAccountRouteState();
             }
         } else {
             state.rateLimitHits = 0;
         }
         if (state.cooldownUntil && state.cooldownUntil <= Date.now()) state.cooldownUntil = 0;
+        this._persistAccountRouteState();
         // Failure thresholds represent consecutive/transient failures. A successful
         // request on this account proves that the previous failure streak is over.
         this.requestFailureCounts.delete(authIndex);
@@ -475,11 +575,69 @@ class RequestHandler {
         if (Number(errorDetails?.status) === 429) {
             this._markAccount429ForModel(authIndex, modelName, errorDetails);
         }
+        this._autoDisableAccountForStatus(authIndex, errorDetails);
+    }
+
+    _shouldSwitchImmediatelyForStatus(status) {
+        const value = Number(status);
+        return Boolean(
+            this.config?.immediateSwitchStatusCodes?.includes(value) ||
+            this.config?.autoDisableStatusCodes?.includes(value)
+        );
+    }
+
+    _autoDisableAccountForStatus(authIndex, errorDetails) {
+        const status = Number(errorDetails?.status);
+        const configured = Array.isArray(this.config?.autoDisableStatusCodes)
+            ? this.config.autoDisableStatusCodes
+            : [401, 403];
+        if (!Number.isInteger(authIndex) || authIndex < 0 || !configured.includes(status)) return false;
+        if (this.accountDisableCleanup?.has(authIndex)) return true;
+
+        const reason = status === 403 ? "forbidden" : status === 401 ? "unauthorized" : `http_${status}`;
+        this.logger.warn(`[Routing] Auto-disabling account #${authIndex} after upstream status ${status}.`);
+        const disableOperation = this.authSource?.isDisabled?.(authIndex)
+            ? Promise.resolve(true)
+            : Promise.resolve(this.authSource?.disableAuth?.(authIndex, { reason, status }));
+        const cleanupPromise = disableOperation
+            .then(async changed => {
+                if (!changed) return;
+                const mutate =
+                    typeof this.browserManager?._withContextPoolMutation === "function"
+                        ? task => this.browserManager._withContextPoolMutation(task)
+                        : task => task();
+                await mutate(async () => {
+                    this.connectionRegistry?.closeMessageQueuesForAuth(authIndex, "account_auto_disabled");
+                    await this.browserManager?.closeContext?.(authIndex);
+                    this.connectionRegistry?.closeConnectionByAuth?.(authIndex);
+                    const nextAuthIndex = this._selectRequestAuthIndex([authIndex]);
+                    if (nextAuthIndex >= 0 && this.browserManager?.launchOrSwitchContext) {
+                        await this.browserManager.launchOrSwitchContext(nextAuthIndex);
+                    }
+                });
+                await this.browserManager?.rebalanceContextPool?.();
+            })
+            .catch(error =>
+                this.logger.warn(`[Routing] Auto-disable cleanup failed for account #${authIndex}: ${error.message}`)
+            )
+            .finally(() => {
+                this.accountDisableCleanup?.delete(authIndex);
+            });
+        this.accountDisableCleanup?.set(authIndex, cleanupPromise);
+        return true;
     }
 
     getAccountRouteStatus(authIndex) {
         const state = this._getAccountRouteState(authIndex);
         return {
+            cooldownModels: Object.entries(state.modelCooldowns || {})
+                .filter(([, until]) => until > Date.now())
+                .map(([model, until]) => ({
+                    model,
+                    remainingMs: Math.max(0, until - Date.now()),
+                    until: new Date(until).toISOString(),
+                }))
+                .sort((a, b) => a.until.localeCompare(b.until)),
             cooldownUntil: state.cooldownUntil > Date.now() ? new Date(state.cooldownUntil).toISOString() : null,
             inFlight: state.inFlight,
             lastError: state.lastError,
@@ -517,6 +675,7 @@ class RequestHandler {
         state.rateLimitHits = 0;
         state.lastError = null;
         state.lastStatus = null;
+        this._persistAccountRouteState();
     }
 
     async testAccount(authIndex) {
@@ -525,6 +684,16 @@ class RequestHandler {
         }
         if (!this.authSource.availableIndices.includes(authIndex)) {
             return { message: `Account #${authIndex} not found.`, status: 404, success: false };
+        }
+        if (this._isAuthUnavailable(authIndex)) {
+            return {
+                authIndex,
+                connected: false,
+                hasContext: this.browserManager.contexts.has(authIndex),
+                message: "Account is disabled or expired; enable it before testing.",
+                status: 409,
+                success: false,
+            };
         }
 
         try {
@@ -578,12 +747,19 @@ class RequestHandler {
                 success: true,
             };
         } catch (error) {
+            const status = Number(error?.status ?? error?.statusCode);
+            if (Number.isInteger(status)) {
+                this._autoDisableAccountForStatus(authIndex, {
+                    message: error.message,
+                    status,
+                });
+            }
             return {
                 authIndex,
                 connected: false,
                 hasContext: false,
                 message: error.message,
-                status: 503,
+                status: Number.isInteger(status) ? status : 503,
                 success: false,
             };
         }
@@ -637,6 +813,8 @@ class RequestHandler {
         this.requestFailureCounts.set(source, failureCount);
 
         const status = Number(errorDetails?.status);
+        this._recordUsageAttemptError(requestId, source, errorDetails);
+        this._autoDisableAccountForStatus(source, errorDetails);
         const modelName = this._normalizeRouteModel(
             errorDetails?.modelName || this.requestModelBindings.get(requestId)
         );
@@ -647,7 +825,7 @@ class RequestHandler {
                 this._markAccount429ForModel(source, modelName, errorDetails);
             }
         }
-        const immediate = this.config.immediateSwitchStatusCodes.includes(status);
+        const immediate = this._shouldSwitchImmediatelyForStatus(status);
         const thresholdReached = this.config.failureThreshold > 0 && failureCount >= this.config.failureThreshold;
         if (!immediate && !thresholdReached) return { success: false, switched: false };
 
@@ -699,7 +877,15 @@ class RequestHandler {
     }
 
     _getUsageStatsService() {
-        return this.serverSystem.usageStatsService || null;
+        return this.serverSystem?.usageStatsService || null;
+    }
+
+    _recordUsageAttemptError(requestId, authIndex, errorDetails) {
+        this._getUsageStatsService()?.recordAttemptResult(requestId, authIndex, {
+            errorMessage: errorDetails?.message || null,
+            outcome: "error",
+            statusCode: errorDetails?.status,
+        });
     }
 
     _getAccountNameForIndex(authIndex) {
@@ -2034,6 +2220,7 @@ class RequestHandler {
                     let currentQueueAuthIndex = this._getRequestAuthIndex(requestId, requestAuthIndex);
                     let initialMessage;
                     let skipFinalFailureSwitch = false;
+                    let retryAttempt = 1;
                     const immediateSwitchTracker = this._createImmediateSwitchTracker(
                         currentQueueAuthIndex,
                         this._getProxyRequestModel(proxyRequest)
@@ -2050,11 +2237,15 @@ class RequestHandler {
                         initialMessage = await currentQueue.dequeue();
 
                         const initialStatus = Number(initialMessage?.status);
+                        if (initialMessage.event_type === "error") {
+                            this._recordUsageAttemptError(requestId, currentQueueAuthIndex, initialMessage);
+                        }
                         if (
                             initialMessage.event_type === "error" &&
                             !isUserAbortedError(initialMessage) &&
                             Number.isFinite(initialStatus) &&
-                            this.config?.immediateSwitchStatusCodes?.includes(initialStatus)
+                            retryAttempt < this.config.maxRetries &&
+                            this._shouldSwitchImmediatelyForStatus(initialStatus)
                         ) {
                             this.logger.warn(
                                 `[Request] OpenAI real stream received ${initialStatus}, preparing retry...`
@@ -2089,9 +2280,18 @@ class RequestHandler {
                                 proxyRequest.request_attempt_id
                             );
                             currentQueueAuthIndex = this._getRequestAuthIndex(requestId, requestAuthIndex);
+                            retryAttempt += 1;
+                            await new Promise(resolve => setTimeout(resolve, this.config.retryDelay));
                             continue;
                         }
 
+                        if (
+                            initialMessage.event_type === "error" &&
+                            this._shouldSwitchImmediatelyForStatus(initialStatus) &&
+                            retryAttempt >= this.config.maxRetries
+                        ) {
+                            skipFinalFailureSwitch = true;
+                        }
                         break;
                     }
 
@@ -2445,6 +2645,7 @@ class RequestHandler {
                     let currentQueueAuthIndex = this._getRequestAuthIndex(requestId, requestAuthIndex);
                     let initialMessage;
                     let skipFinalFailureSwitch = false;
+                    let retryAttempt = 1;
                     const immediateSwitchTracker = this._createImmediateSwitchTracker(
                         currentQueueAuthIndex,
                         this._getProxyRequestModel(proxyRequest)
@@ -2461,11 +2662,15 @@ class RequestHandler {
                         initialMessage = await currentQueue.dequeue();
 
                         const initialStatus = Number(initialMessage?.status);
+                        if (initialMessage.event_type === "error") {
+                            this._recordUsageAttemptError(requestId, currentQueueAuthIndex, initialMessage);
+                        }
                         if (
                             initialMessage.event_type === "error" &&
                             !isUserAbortedError(initialMessage) &&
                             Number.isFinite(initialStatus) &&
-                            this.config?.immediateSwitchStatusCodes?.includes(initialStatus)
+                            retryAttempt < this.config.maxRetries &&
+                            this._shouldSwitchImmediatelyForStatus(initialStatus)
                         ) {
                             this.logger.warn(
                                 `[Request] OpenAI Response API real stream received ${initialStatus}, preparing retry...`
@@ -2500,9 +2705,18 @@ class RequestHandler {
                                 proxyRequest.request_attempt_id
                             );
                             currentQueueAuthIndex = this._getRequestAuthIndex(requestId, requestAuthIndex);
+                            retryAttempt += 1;
+                            await new Promise(resolve => setTimeout(resolve, this.config.retryDelay));
                             continue;
                         }
 
+                        if (
+                            initialMessage.event_type === "error" &&
+                            this._shouldSwitchImmediatelyForStatus(initialStatus) &&
+                            retryAttempt >= this.config.maxRetries
+                        ) {
+                            skipFinalFailureSwitch = true;
+                        }
                         break;
                     }
 
@@ -2825,6 +3039,7 @@ class RequestHandler {
                     let currentQueueAuthIndex = this._getRequestAuthIndex(requestId, requestAuthIndex);
                     let initialMessage;
                     let skipFinalFailureSwitch = false;
+                    let retryAttempt = 1;
                     const immediateSwitchTracker = this._createImmediateSwitchTracker(
                         currentQueueAuthIndex,
                         this._getProxyRequestModel(proxyRequest)
@@ -2841,11 +3056,15 @@ class RequestHandler {
                         initialMessage = await currentQueue.dequeue();
 
                         const initialStatus = Number(initialMessage?.status);
+                        if (initialMessage.event_type === "error") {
+                            this._recordUsageAttemptError(requestId, currentQueueAuthIndex, initialMessage);
+                        }
                         if (
                             initialMessage.event_type === "error" &&
                             !isUserAbortedError(initialMessage) &&
                             Number.isFinite(initialStatus) &&
-                            this.config?.immediateSwitchStatusCodes?.includes(initialStatus)
+                            retryAttempt < this.config.maxRetries &&
+                            this._shouldSwitchImmediatelyForStatus(initialStatus)
                         ) {
                             this.logger.warn(
                                 `[Request] Claude real stream received ${initialStatus}, preparing retry...`
@@ -2880,9 +3099,18 @@ class RequestHandler {
                                 proxyRequest.request_attempt_id
                             );
                             currentQueueAuthIndex = this._getRequestAuthIndex(requestId, requestAuthIndex);
+                            retryAttempt += 1;
+                            await new Promise(resolve => setTimeout(resolve, this.config.retryDelay));
                             continue;
                         }
 
+                        if (
+                            initialMessage.event_type === "error" &&
+                            this._shouldSwitchImmediatelyForStatus(initialStatus) &&
+                            retryAttempt >= this.config.maxRetries
+                        ) {
+                            skipFinalFailureSwitch = true;
+                        }
                         break;
                     }
 
@@ -3802,6 +4030,7 @@ class RequestHandler {
         let currentQueueAuthIndex = this._getRequestAuthIndex(proxyRequest.request_id, this.currentAuthIndex);
         let headerMessage;
         let skipFinalFailureSwitch = false;
+        let retryAttempt = 1;
         const immediateSwitchTracker = this._createImmediateSwitchTracker(
             currentQueueAuthIndex,
             this._getProxyRequestModel(proxyRequest)
@@ -3819,12 +4048,16 @@ class RequestHandler {
             headerMessage = await currentQueue.dequeue();
 
             const headerStatus = Number(headerMessage?.status);
+            if (headerMessage.event_type === "error") {
+                this._recordUsageAttemptError(proxyRequest.request_id, currentQueueAuthIndex, headerMessage);
+            }
             if (
                 headerMessage.event_type === "error" &&
                 proxyRequest.is_generative &&
                 !isUserAbortedError(headerMessage) &&
                 Number.isFinite(headerStatus) &&
-                this.config?.immediateSwitchStatusCodes?.includes(headerStatus)
+                retryAttempt < this.config.maxRetries &&
+                this._shouldSwitchImmediatelyForStatus(headerStatus)
             ) {
                 this.logger.warn(`[Request] Gemini real stream received ${headerStatus}, preparing retry...`);
                 this._markImmediateRateLimitIfNeeded(
@@ -3858,9 +4091,18 @@ class RequestHandler {
                     proxyRequest.request_attempt_id
                 );
                 currentQueueAuthIndex = this._getRequestAuthIndex(proxyRequest.request_id, this.currentAuthIndex);
+                retryAttempt += 1;
+                await new Promise(resolve => setTimeout(resolve, this.config.retryDelay));
                 continue;
             }
 
+            if (
+                headerMessage.event_type === "error" &&
+                this._shouldSwitchImmediatelyForStatus(headerStatus) &&
+                retryAttempt >= this.config.maxRetries
+            ) {
+                skipFinalFailureSwitch = true;
+            }
             break;
         }
 
@@ -4241,9 +4483,11 @@ class RequestHandler {
                 }
 
                 lastError = errorPayload;
+                this._recordUsageAttemptError(proxyRequest.request_id, currentQueueAuthIndex, errorPayload);
                 this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
 
                 const errorStatus = Number(errorPayload?.status);
+                this._autoDisableAccountForStatus(currentQueueAuthIndex, errorPayload);
                 if (errorStatus === 429) {
                     this._markAccount429ForModel(
                         currentQueueAuthIndex,
@@ -4265,7 +4509,8 @@ class RequestHandler {
                 // Check if we should stop retrying immediately based on status code
                 if (
                     Number.isFinite(errorStatus) &&
-                    this.config?.immediateSwitchStatusCodes?.includes(errorStatus) &&
+                    retryAttempt < this.config.maxRetries &&
+                    this._shouldSwitchImmediatelyForStatus(errorStatus) &&
                     !isUserAbortedError(errorPayload)
                 ) {
                     this.logger.warn(`[Request] Received ${errorStatus}, preparing retry...`);
@@ -4304,7 +4549,17 @@ class RequestHandler {
                         proxyRequest.request_attempt_id
                     );
                     currentQueueAuthIndex = this._getRequestAuthIndex(proxyRequest.request_id, this.currentAuthIndex);
+                    retryAttempt += 1;
+                    await new Promise(resolve => setTimeout(resolve, this.config.retryDelay));
                     continue;
+                }
+
+                if (
+                    Number.isFinite(errorStatus) &&
+                    retryAttempt >= this.config.maxRetries &&
+                    this._shouldSwitchImmediatelyForStatus(errorStatus)
+                ) {
+                    lastError = { ...errorPayload, skipAccountSwitch: true };
                 }
 
                 // Log the warning for the current attempt

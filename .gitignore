@@ -41,3 +41,6 @@ debug_*.png
 debug_*.html
 proxylist.txt
 proxy_mapping.json
+
+# Keep production UI styles in the distributable frontend
+!ui/dist/assets/*.css

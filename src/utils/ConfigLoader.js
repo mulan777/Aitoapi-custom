@@ -24,6 +24,7 @@ class ConfigLoader {
             accountCooldownMs: 300000,
             apiKeys: [],
             apiKeySource: "Not set",
+            autoDisableStatusCodes: [401, 403],
             browserExecutablePath: null,
             checkUpdate: true,
             enableAuthUpdate: true,
@@ -69,6 +70,9 @@ class ConfigLoader {
         if (process.env.RETRY_DELAY) {
             const parsed = parseInt(process.env.RETRY_DELAY, 10);
             config.retryDelay = Number.isFinite(parsed) ? Math.max(50, parsed) : config.retryDelay;
+        }
+        if (process.env.AUTO_DISABLE_STATUS_CODES) {
+            config.autoDisableStatusCodes = this._parseStatusCodes(process.env.AUTO_DISABLE_STATUS_CODES, [401, 403]);
         }
         if (process.env.STREAM_TIMEOUT_MS) {
             const parsed = parseInt(process.env.STREAM_TIMEOUT_MS, 10);
@@ -211,6 +215,18 @@ class ConfigLoader {
         return config;
     }
 
+    _parseStatusCodes(value, fallback = []) {
+        const values = Array.isArray(value) ? value : String(value || "").split(",");
+        const parsed = [
+            ...new Set(
+                values
+                    .map(item => Number.parseInt(String(item).trim(), 10))
+                    .filter(code => Number.isInteger(code) && code >= 400 && code <= 599)
+            ),
+        ];
+        return parsed.length > 0 ? parsed : [...fallback];
+    }
+
     _applyRuntimeSettings(config) {
         const runtimeSettingsPath = path.join(process.cwd(), "configs", "runtime-settings.json");
         if (!fs.existsSync(runtimeSettingsPath)) return;
@@ -222,6 +238,11 @@ class ConfigLoader {
             const isIntegerInRange = (value, min, max) => Number.isInteger(value) && value >= min && value <= max;
 
             if (isIntegerInRange(raw.maxContexts, 0, 1000)) config.maxContexts = raw.maxContexts;
+            if (isIntegerInRange(raw.maxRetries, 1, 20)) config.maxRetries = raw.maxRetries;
+            if (isIntegerInRange(raw.retryDelay, 50, 600000)) config.retryDelay = raw.retryDelay;
+            if (Array.isArray(raw.autoDisableStatusCodes)) {
+                config.autoDisableStatusCodes = this._parseStatusCodes(raw.autoDisableStatusCodes, []);
+            }
             if (isIntegerInRange(raw.accountCooldownMs, 1000, 86400000)) {
                 config.accountCooldownMs = raw.accountCooldownMs;
             }
@@ -273,6 +294,7 @@ class ConfigLoader {
         );
         this.logger.info(`  Max Retries per Request: ${config.maxRetries} times`);
         this.logger.info(`  Retry Delay: ${config.retryDelay}ms`);
+        this.logger.info(`  Auto-disable Status Codes: ${config.autoDisableStatusCodes.join(", ")}`);
         this.logger.info(`  API Key Source: ${config.apiKeySource}`);
 
         const proxySummary = getProxySummaryFromEnv();

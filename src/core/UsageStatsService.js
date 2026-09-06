@@ -126,6 +126,24 @@ class UsageStatsService {
         this._pushAttempt(tracker, normalizedAuthIndex, resolvedAccountName);
     }
 
+    recordAttemptResult(requestId, authIndex, result = {}) {
+        if (!this.enabled) return;
+        const tracker = this.activeRequests.get(requestId);
+        if (!tracker) return;
+        const normalizedAuthIndex = this._normalizeAuthIndex(authIndex);
+        for (let index = tracker.attempts.length - 1; index >= 0; index -= 1) {
+            const attempt = tracker.attempts[index];
+            const parsed = this._parseAccountKey(attempt.accountKey);
+            if (attempt.outcome || (normalizedAuthIndex !== null && parsed.authIndex !== normalizedAuthIndex)) continue;
+            attempt.errorMessage = result.errorMessage || result.message || null;
+            attempt.outcome = this._normalizeOutcome(result.outcome);
+            attempt.statusCode = Number.isFinite(Number(result.statusCode ?? result.status))
+                ? Number(result.statusCode ?? result.status)
+                : null;
+            return;
+        }
+    }
+
     finishRequest(requestId, result = {}) {
         if (!this.enabled) return null;
         const tracker = this.activeRequests.get(requestId);
@@ -141,6 +159,12 @@ class UsageStatsService {
 
         const finishedAtMs = Date.now();
         const lastAttempt = tracker.attempts[tracker.attempts.length - 1] || null;
+        const finalOutcome = this._normalizeOutcome(result.outcome);
+        if (lastAttempt && !lastAttempt.outcome) {
+            lastAttempt.outcome = finalOutcome;
+            lastAttempt.statusCode = Number.isFinite(Number(result.statusCode)) ? Number(result.statusCode) : null;
+            lastAttempt.errorMessage = result.errorMessage || null;
+        }
         const lastParsed = lastAttempt?.accountKey ? this._parseAccountKey(lastAttempt.accountKey) : {};
         const finalAuthIndex =
             this._normalizeAuthIndex(result.finalAuthIndex) ?? lastParsed.authIndex ?? tracker.initialAuthIndex ?? null;
@@ -149,7 +173,7 @@ class UsageStatsService {
             lastParsed.accountName ??
             tracker.initialAccountName ??
             null;
-        const outcome = this._normalizeOutcome(result.outcome);
+        const outcome = finalOutcome;
         const statusCode = Number.isFinite(result.statusCode) ? Number(result.statusCode) : null;
         const durationMs = Math.max(0, finishedAtMs - tracker.startedAtMs);
         const accountKey = this._buildAccountKey(finalAuthIndex, finalAccountName);
@@ -158,7 +182,12 @@ class UsageStatsService {
             accountKey,
             apiFormat: tracker.apiFormat,
             attemptCount: tracker.attemptCount,
-            attempts: tracker.attempts.map(item => ({ accountKey: item.accountKey })),
+            attempts: tracker.attempts.map(item => ({
+                accountKey: item.accountKey,
+                errorMessage: item.errorMessage || null,
+                outcome: item.outcome || null,
+                statusCode: Number.isFinite(Number(item.statusCode)) ? Number(item.statusCode) : null,
+            })),
             clientIp: tracker.clientIp,
             durationMs,
             errorMessage: result.errorMessage || null,
@@ -190,6 +219,66 @@ class UsageStatsService {
         this._appendRecord(record);
 
         return record;
+    }
+
+    /** Return today's per-credential success/failure counts grouped by model. */
+    getTodayAccountStats(date = new Date()) {
+        if (!this.enabled) return {};
+        const todayKey = this._getLocalDateKey(date);
+        const result = {};
+        for (const record of this.records) {
+            if (this._getLocalDateKey(record.finishedAt) !== todayKey) continue;
+            const attempts = Array.isArray(record.attempts)
+                ? record.attempts.filter(attempt => attempt?.accountKey && attempt?.outcome)
+                : [];
+            const entries =
+                attempts.length > 0
+                    ? attempts.map(attempt => ({
+                          ...this._parseAccountKey(attempt.accountKey),
+                          outcome: attempt.outcome,
+                      }))
+                    : [{ authIndex: this._normalizeAuthIndex(record.finalAuthIndex), outcome: record.outcome }];
+            for (const entry of entries) {
+                const authIndex = this._normalizeAuthIndex(entry.authIndex);
+                if (authIndex === null) continue;
+                const accountKey = String(authIndex);
+                const account = result[accountKey] || {
+                    failureCount: 0,
+                    models: {},
+                    successCount: 0,
+                    totalCount: 0,
+                };
+                const model = record.model || "unknown";
+                const modelStats = account.models[model] || { failureCount: 0, successCount: 0, totalCount: 0 };
+                account.totalCount += 1;
+                modelStats.totalCount += 1;
+                if (entry.outcome === "success") {
+                    account.successCount += 1;
+                    modelStats.successCount += 1;
+                } else {
+                    account.failureCount += 1;
+                    modelStats.failureCount += 1;
+                }
+                account.models[model] = modelStats;
+                result[accountKey] = account;
+            }
+        }
+
+        for (const account of Object.values(result)) {
+            account.models = Object.entries(account.models)
+                .map(([model, values]) => ({ model, ...values }))
+                .sort((a, b) => b.totalCount - a.totalCount || a.model.localeCompare(b.model));
+        }
+        return result;
+    }
+
+    _getLocalDateKey(value) {
+        const date = value instanceof Date ? value : new Date(value);
+        if (Number.isNaN(date.getTime())) return "";
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, "0");
+        const day = String(date.getDate()).padStart(2, "0");
+        return `${year}-${month}-${day}`;
     }
 
     getSnapshot() {
@@ -520,7 +609,7 @@ class UsageStatsService {
         const accountKey = this._buildAccountKey(authIndex, normalizedAccountName);
 
         tracker.attemptCount += 1;
-        tracker.attempts.push({ accountKey });
+        tracker.attempts.push({ accountKey, errorMessage: null, outcome: null, statusCode: null });
     }
 
     _updateSummary(record) {

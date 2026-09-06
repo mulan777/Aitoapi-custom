@@ -20,6 +20,25 @@ class AuthSwitcher {
         this.isSystemBusy = false;
     }
 
+    async _switchUsingAtomicReplacement(targetIndex) {
+        const sourceIndex = this.currentAuthIndex;
+        if (
+            Number.isInteger(sourceIndex) &&
+            sourceIndex >= 0 &&
+            sourceIndex !== targetIndex &&
+            typeof this.browserManager.replaceContextForAuth === "function"
+        ) {
+            const replaced = await this.browserManager.replaceContextForAuth(sourceIndex, targetIndex, {
+                activateTarget: true,
+                reason: "auth_switch",
+            });
+            if (!replaced)
+                throw new Error(`Failed to atomically replace account #${sourceIndex} with #${targetIndex}.`);
+            return;
+        }
+        await this.browserManager.switchAccount(targetIndex);
+    }
+
     get currentAuthIndex() {
         return this.browserManager.currentAuthIndex;
     }
@@ -130,9 +149,7 @@ class AuthSwitcher {
                 );
 
                 try {
-                    // Pre-cleanup: remove excess contexts BEFORE creating new one to avoid exceeding maxContexts
-                    await this.browserManager.preCleanupForSwitch(accountIndex);
-                    await this.browserManager.switchAccount(accountIndex);
+                    await this._switchUsingAtomicReplacement(accountIndex);
                     this.resetCounters();
                     this.browserManager.rebalanceContextPool().catch(err => {
                         this.logger.error(`[Auth] Background rebalance failed: ${err.message}`);
@@ -165,9 +182,7 @@ class AuthSwitcher {
                 this.logger.warn("==================================================");
 
                 try {
-                    // Pre-cleanup: remove excess contexts BEFORE creating new one to avoid exceeding maxContexts
-                    await this.browserManager.preCleanupForSwitch(originalStartAccount);
-                    await this.browserManager.switchAccount(originalStartAccount);
+                    await this._switchUsingAtomicReplacement(originalStartAccount);
                     this.resetCounters();
                     this.browserManager.rebalanceContextPool().catch(err => {
                         this.logger.error(`[Auth] Background rebalance failed: ${err.message}`);
@@ -216,7 +231,7 @@ class AuthSwitcher {
 
         // For manual switch, respect user's choice - don't auto-redirect to canonical index
         // UI already shows duplicate indicator, so user is making a deliberate choice
-        if (!this.authSource.availableIndices.includes(targetIndex)) {
+        if (!this.authSource.availableIndices.includes(targetIndex) || this.authSource.isUnavailable?.(targetIndex)) {
             return {
                 reason: `Switch failed: Account #${targetIndex} invalid or does not exist.`,
                 success: false,
@@ -226,9 +241,7 @@ class AuthSwitcher {
         this.isSystemBusy = true;
         try {
             this.logger.info(`🔄 [Auth] Starting switch to specified account #${targetIndex}...`);
-            // Pre-cleanup: remove excess contexts BEFORE creating new one to avoid exceeding maxContexts
-            await this.browserManager.preCleanupForSwitch(targetIndex);
-            await this.browserManager.switchAccount(targetIndex);
+            await this._switchUsingAtomicReplacement(targetIndex);
             this.resetCounters();
             this.browserManager.rebalanceContextPool().catch(err => {
                 this.logger.error(`[Auth] Background rebalance failed: ${err.message}`);

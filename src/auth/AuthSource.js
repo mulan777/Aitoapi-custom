@@ -24,13 +24,18 @@ class AuthSource {
         this.duplicateIndices = [];
         // Expired auth indices (valid JSON but marked as expired, excluded from rotation)
         this.expiredIndices = [];
+        // Disabled auth indices (manual or automatic status-code quarantine)
+        this.disabledIndices = [];
         this.initialIndices = [];
         this.accountNameMap = new Map();
+        this.accountStatusMap = new Map();
         // Map any valid index -> canonical (latest) index for the same account email
         this.canonicalIndexMap = new Map();
         // Duplicate groups (email -> kept + duplicates)
         this.duplicateGroups = [];
         this.lastScannedIndices = "[]"; // Cache to track changes
+        this.lastScannedSignature = "[]";
+        this.currentScanSignature = "[]";
 
         this.logger.info('[Auth] Using files in "configs/auth/" directory for authentication.');
 
@@ -44,18 +49,20 @@ class AuthSource {
     }
 
     reloadAuthSources(isInitialLoad = false) {
-        const oldIndices = this.lastScannedIndices;
+        const oldSignature = this.lastScannedSignature;
         this._discoverAvailableIndices();
         const newIndices = JSON.stringify(this.initialIndices);
+        const newSignature = this.currentScanSignature;
 
-        // Only log verbosely if it's the first load or if the file list has actually changed.
-        if (isInitialLoad || oldIndices !== newIndices) {
+        // Reload when a file is added/removed or replaced in place.
+        if (isInitialLoad || oldSignature !== newSignature) {
             this.logger.info(`[Auth] Auth file scan detected changes. Reloading and re-validating...`);
             this._preValidateAndFilter();
             this.logger.info(
                 `[Auth] Reload complete. ${this.availableIndices.length} valid sources available: [${this.availableIndices.join(", ")}]`
             );
             this.lastScannedIndices = newIndices;
+            this.lastScannedSignature = newSignature;
             return true; // Changes detected
         }
         return false; // No changes
@@ -89,16 +96,24 @@ class AuthSource {
         if (!fs.existsSync(configDir)) {
             this.availableIndices = [];
             this.initialIndices = [];
+            this.currentScanSignature = "[]";
             return;
         }
         try {
             const files = fs.readdirSync(configDir);
-            const authFiles = files.filter(file => /^auth-\d+\.json$/.test(file));
+            const authFiles = files.filter(file => /^auth-\d+\.json$/.test(file)).sort();
             indices = authFiles.map(file => parseInt(file.match(/^auth-(\d+)\.json$/)[1], 10));
+            this.currentScanSignature = JSON.stringify(
+                authFiles.map(file => {
+                    const stat = fs.statSync(path.join(configDir, file));
+                    return [file, stat.size, Math.trunc(stat.mtimeMs)];
+                })
+            );
         } catch (error) {
             this.logger.error(`[Auth] Failed to scan "configs/auth/" directory: ${error.message}`);
             this.availableIndices = [];
             this.initialIndices = [];
+            this.currentScanSignature = "[]";
             return;
         }
 
@@ -111,7 +126,9 @@ class AuthSource {
             this.rotationIndices = [];
             this.duplicateIndices = [];
             this.expiredIndices = [];
+            this.disabledIndices = [];
             this.accountNameMap.clear();
+            this.accountStatusMap.clear();
             this.canonicalIndexMap.clear();
             this.duplicateGroups = [];
             return;
@@ -120,9 +137,11 @@ class AuthSource {
         const validIndices = [];
         const invalidSourceDescriptions = [];
         this.accountNameMap.clear(); // Clear old names before re-validating
+        this.accountStatusMap.clear();
         this.canonicalIndexMap.clear();
         this.duplicateGroups = [];
         this.expiredIndices = [];
+        this.disabledIndices = [];
 
         for (const index of this.initialIndices) {
             // Iterate over initial to check all, not just previously available
@@ -132,9 +151,19 @@ class AuthSource {
                     const authData = JSON.parse(authContent);
                     validIndices.push(index);
                     this.accountNameMap.set(index, authData.accountName || null);
+                    this.accountStatusMap.set(index, {
+                        disabledAt: authData.disabledAt || null,
+                        disabledReason: authData.disabledReason || null,
+                        disabledStatus: Number.isFinite(Number(authData.disabledStatus))
+                            ? Number(authData.disabledStatus)
+                            : null,
+                    });
                     // Track expired status from auth file
                     if (authData.expired === true) {
                         this.expiredIndices.push(index);
+                    }
+                    if (authData.disabled === true) {
+                        this.disabledIndices.push(index);
                     }
                 } catch (e) {
                     invalidSourceDescriptions.push(`auth-${index} (parse error)`);
@@ -176,8 +205,10 @@ class AuthSource {
 
         const emailKeyToIndices = new Map();
 
-        // Only process non-expired accounts for rotation and deduplication
-        const nonExpiredIndices = this.availableIndices.filter(idx => !this.expiredIndices.includes(idx));
+        // Only process usable accounts for rotation and deduplication
+        const nonExpiredIndices = this.availableIndices.filter(
+            idx => !this.expiredIndices.includes(idx) && !this.disabledIndices.includes(idx)
+        );
 
         for (const index of nonExpiredIndices) {
             const accountName = this.accountNameMap.get(index);
@@ -233,6 +264,12 @@ class AuthSource {
                     `These accounts are excluded from automatic rotation.`
             );
         }
+        if (this.disabledIndices.length > 0) {
+            this.logger.warn(
+                `[Auth] Detected ${this.disabledIndices.length} disabled auth files: [${this.disabledIndices.join(", ")}]. ` +
+                    `These accounts are excluded from automatic rotation.`
+            );
+        }
     }
 
     _getAuthContent(index) {
@@ -263,6 +300,10 @@ class AuthSource {
             this.logger.error(`[Auth] Failed to parse JSON content from authentication source #${index}: ${e.message}`);
             return null;
         }
+    }
+
+    getStatusMetadata(index) {
+        return this.accountStatusMap.get(index) || { disabledAt: null, disabledReason: null, disabledStatus: null };
     }
 
     getRotationIndices() {
@@ -298,6 +339,9 @@ class AuthSource {
         }
 
         if (this.expiredIndices.includes(index)) {
+            if (!this.disabledIndices.includes(index)) {
+                return this.disableAuth(index, { reason: "expired" });
+            }
             this.logger.debug(`[Auth] Auth #${index} is already marked as expired`);
             return false;
         }
@@ -307,11 +351,20 @@ class AuthSource {
             const fileContent = await fsPromises.readFile(authFilePath, "utf-8");
             const authData = JSON.parse(fileContent);
             authData.expired = true;
+            authData.disabled = true;
+            authData.disabledReason = authData.disabledReason || "expired";
+            authData.disabledAt = authData.disabledAt || new Date().toISOString();
             await fsPromises.writeFile(authFilePath, JSON.stringify(authData, null, 2));
 
-            this.expiredIndices.push(index);
+            if (!this.expiredIndices.includes(index)) this.expiredIndices.push(index);
+            if (!this.disabledIndices.includes(index)) this.disabledIndices.push(index);
+            this.accountStatusMap.set(index, {
+                disabledAt: authData.disabledAt,
+                disabledReason: authData.disabledReason,
+                disabledStatus: authData.disabledStatus || null,
+            });
 
-            // Rebuild rotation indices to exclude this expired account
+            // Rebuild rotation indices to exclude this unavailable account
             // This will properly rebuild canonicalIndexMap and handle duplicate relationships
             this._buildRotationIndices();
 
@@ -351,9 +404,21 @@ class AuthSource {
             const fileContent = await fsPromises.readFile(authFilePath, "utf-8");
             const authData = JSON.parse(fileContent);
             delete authData.expired;
+            if (authData.disabledReason === "expired") {
+                delete authData.disabled;
+                delete authData.disabledReason;
+                delete authData.disabledAt;
+                delete authData.disabledStatus;
+            }
             await fsPromises.writeFile(authFilePath, JSON.stringify(authData, null, 2));
 
             this.expiredIndices = this.expiredIndices.filter(idx => idx !== index);
+            this.disabledIndices = this.disabledIndices.filter(idx => idx !== index);
+            this.accountStatusMap.set(index, {
+                disabledAt: null,
+                disabledReason: null,
+                disabledStatus: null,
+            });
 
             // Rebuild rotation indices to include this restored account
             this._buildRotationIndices();
@@ -364,6 +429,79 @@ class AuthSource {
             this.logger.error(`[Auth] Failed to restore auth #${index}: ${error.message}`);
             return false;
         }
+    }
+
+    /**
+     * Disable an auth source and persist the reason. Disabled accounts remain
+     * visible in the UI but are excluded from automatic rotation.
+     */
+    async disableAuth(index, metadata = {}) {
+        if (!this.availableIndices.includes(index)) return false;
+        const authFilePath = path.join(process.cwd(), "configs", "auth", `auth-${index}.json`);
+        const wasDisabled = this.disabledIndices.includes(index);
+        if (!wasDisabled) {
+            this.disabledIndices.push(index);
+            this._buildRotationIndices();
+        }
+        try {
+            const authData = JSON.parse(await fsPromises.readFile(authFilePath, "utf-8"));
+            authData.disabled = true;
+            authData.disabledReason = String(metadata.reason || authData.disabledReason || "manual");
+            if (authData.disabledReason === "expired") authData.expired = true;
+            if (metadata.status !== undefined) authData.disabledStatus = Number(metadata.status);
+            authData.disabledAt = new Date().toISOString();
+            await fsPromises.writeFile(authFilePath, JSON.stringify(authData, null, 2));
+            if (!this.disabledIndices.includes(index)) this.disabledIndices.push(index);
+            this.accountStatusMap.set(index, {
+                disabledAt: authData.disabledAt,
+                disabledReason: authData.disabledReason,
+                disabledStatus: authData.disabledStatus || null,
+            });
+            this._buildRotationIndices();
+            this.logger.warn(
+                `[Auth] Disabled auth #${index} (${authData.disabledReason}${authData.disabledStatus ? `, status ${authData.disabledStatus}` : ""})`
+            );
+            return true;
+        } catch (error) {
+            if (!wasDisabled) {
+                this.disabledIndices = this.disabledIndices.filter(idx => idx !== index);
+                this._buildRotationIndices();
+            }
+            this.logger.error(`[Auth] Failed to disable auth #${index}: ${error.message}`);
+            return false;
+        }
+    }
+
+    /** Re-enable an auth source after the operator has fixed/replaced it. */
+    async enableAuth(index) {
+        if (!this.availableIndices.includes(index)) return false;
+        const authFilePath = path.join(process.cwd(), "configs", "auth", `auth-${index}.json`);
+        try {
+            const authData = JSON.parse(await fsPromises.readFile(authFilePath, "utf-8"));
+            delete authData.disabled;
+            delete authData.disabledReason;
+            delete authData.disabledAt;
+            delete authData.disabledStatus;
+            delete authData.expired;
+            await fsPromises.writeFile(authFilePath, JSON.stringify(authData, null, 2));
+            this.disabledIndices = this.disabledIndices.filter(idx => idx !== index);
+            this.expiredIndices = this.expiredIndices.filter(idx => idx !== index);
+            this.accountStatusMap.set(index, { disabledAt: null, disabledReason: null, disabledStatus: null });
+            this._buildRotationIndices();
+            this.logger.info(`[Auth] Enabled auth #${index}`);
+            return true;
+        } catch (error) {
+            this.logger.error(`[Auth] Failed to enable auth #${index}: ${error.message}`);
+            return false;
+        }
+    }
+
+    isDisabled(index) {
+        return this.disabledIndices.includes(index);
+    }
+
+    isUnavailable(index) {
+        return this.isExpired(index) || this.isDisabled(index);
     }
 
     /**

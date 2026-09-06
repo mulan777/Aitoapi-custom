@@ -49,7 +49,10 @@ class StatusRoutes {
         const runtimeSettings = {
             accountCooldownMaxMs: this.config.accountCooldownMaxMs,
             accountCooldownMs: this.config.accountCooldownMs,
+            autoDisableStatusCodes: this.config.autoDisableStatusCodes,
             maxContexts: this.config.maxContexts,
+            maxRetries: this.config.maxRetries,
+            retryDelay: this.config.retryDelay,
         };
         const directory = path.dirname(this.runtimeSettingsPath);
         await fs.promises.mkdir(directory, { recursive: true });
@@ -426,6 +429,70 @@ class StatusRoutes {
             } catch (error) {
                 this.logger.error(`[WebUI] Account test failed for #${targetIndex}: ${error.message}`);
                 return res.status(503).json({ authIndex: targetIndex, message: error.message, success: false });
+            }
+        });
+
+        app.put("/api/accounts/:index/enabled", isAuthenticated, async (req, res) => {
+            if (this._rejectIfSystemBusy(res)) return;
+            const targetIndex = Number(req.params.index);
+            if (!Number.isInteger(targetIndex) || targetIndex < 0) {
+                return res.status(400).json({ message: "errorInvalidIndex" });
+            }
+            const { authSource, browserManager, connectionRegistry } = this.serverSystem;
+            if (!authSource.initialIndices.includes(targetIndex)) {
+                return res.status(404).json({ message: "errorAccountNotFound" });
+            }
+            const enabled = req.body?.enabled !== false;
+            try {
+                const mutate =
+                    typeof browserManager._withContextPoolMutation === "function"
+                        ? task => browserManager._withContextPoolMutation(task)
+                        : task => task();
+                let changed = false;
+                await mutate(async () => {
+                    changed = enabled
+                        ? await authSource.enableAuth(targetIndex)
+                        : await authSource.disableAuth(targetIndex, {
+                              reason: "manual",
+                          });
+                    if (!changed && enabled && authSource.isUnavailable?.(targetIndex)) {
+                        return;
+                    }
+                    if (!enabled) {
+                        const wasCurrent = browserManager.currentAuthIndex === targetIndex;
+                        connectionRegistry.closeMessageQueuesForAuth(targetIndex, "account_disabled");
+                        await browserManager.closeContext(targetIndex);
+                        connectionRegistry.closeConnectionByAuth(targetIndex);
+                        if (wasCurrent) {
+                            const replacement =
+                                authSource.getRotationIndices().find(index => browserManager.contexts.has(index)) ??
+                                authSource.getRotationIndices()[0];
+                            if (Number.isInteger(replacement)) await browserManager.launchOrSwitchContext(replacement);
+                        }
+                    }
+                });
+                if (!changed && enabled && authSource.isUnavailable?.(targetIndex)) {
+                    return res.status(409).json({ message: "accountEnableFailed" });
+                }
+                authSource.reloadAuthSources();
+                browserManager
+                    .rebalanceContextPool()
+                    .catch(error =>
+                        this.logger.warn(`[Auth] Rebalance after account state change failed: ${error.message}`)
+                    );
+                return res.status(200).json({
+                    enabled,
+                    index: targetIndex,
+                    message: enabled ? "accountEnableSuccess" : "accountDisableSuccess",
+                    success: true,
+                });
+            } catch (error) {
+                this.logger.error(
+                    `[WebUI] Failed to ${enabled ? "enable" : "disable"} account #${targetIndex}: ${error.message}`
+                );
+                return res
+                    .status(500)
+                    .json({ error: error.message, message: enabled ? "accountEnableFailed" : "accountDisableFailed" });
             }
         });
 
@@ -885,6 +952,33 @@ class StatusRoutes {
             });
         };
 
+        app.put("/api/settings/max-retries", isAuthenticated, (req, res) =>
+            updateNumericSetting(req, res, "maxRetries", { max: 20, min: 1 })
+        );
+        app.put("/api/settings/retry-delay", isAuthenticated, (req, res) =>
+            updateNumericSetting(req, res, "retryDelay", { max: 600000, min: 50 })
+        );
+        app.put("/api/settings/auto-disable-status-codes", isAuthenticated, async (req, res) => {
+            const rawCodes = Array.isArray(req.body?.value) ? req.body.value : String(req.body?.value || "").split(",");
+            const codes = [
+                ...new Set(
+                    rawCodes
+                        .map(value => Number.parseInt(String(value).trim(), 10))
+                        .filter(value => Number.isInteger(value) && value >= 400 && value <= 599)
+                ),
+            ];
+            this.config.autoDisableStatusCodes = codes;
+            try {
+                await this._saveRuntimeSettings();
+                this.logger.info(`[WebUI] Auto-disable status codes updated to: ${codes.join(", ")}`);
+                return res
+                    .status(200)
+                    .json({ message: "settingUpdateSuccess", setting: "autoDisableStatusCodes", value: codes });
+            } catch (error) {
+                return res.status(500).json({ error: error.message, message: "settingFailed" });
+            }
+        });
+
         app.put("/api/settings/max-contexts", isAuthenticated, (req, res) =>
             updateNumericSetting(req, res, "maxContexts", { max: 1000, min: 0 })
         );
@@ -1052,6 +1146,8 @@ class StatusRoutes {
         const rotationIndices = authSource.getRotationIndices();
         const duplicateIndices = authSource.duplicateIndices || [];
         const expiredIndices = authSource.expiredIndices || [];
+        const disabledIndices = authSource.disabledIndices || [];
+        const todayStats = this.serverSystem.usageStatsService?.getTodayAccountStats?.() || {};
         const limit = this.logger.displayLimit || 100;
         const allLogs = this.logger.logBuffer || [];
         const displayLogs = allLogs.slice(-limit);
@@ -1064,20 +1160,32 @@ class StatusRoutes {
             const isDuplicate = canonicalIndex !== null && canonicalIndex !== index;
             const isRotation = rotationIndices.includes(index);
             const isExpired = expiredIndices.includes(index);
+            const isDisabled = disabledIndices.includes(index);
+            const authMetadata = isInvalid ? null : authSource.getStatusMetadata(index);
 
             const hasContext = browserManager.contexts.has(index);
             const route = requestHandler.getAccountRouteStatus(index);
 
             return {
                 canonicalIndex,
+                disabledAt: authMetadata?.disabledAt || null,
+                disabledReason: authMetadata?.disabledReason || null,
+                disabledStatus: authMetadata?.disabledStatus || null,
                 hasContext,
                 index,
+                isDisabled,
                 isDuplicate,
                 isExpired,
                 isInvalid,
                 isRotation,
                 name,
                 route,
+                todayStats: todayStats[String(index)] || {
+                    failureCount: 0,
+                    models: [],
+                    successCount: 0,
+                    totalCount: 0,
+                },
             };
         });
 
@@ -1102,12 +1210,15 @@ class StatusRoutes {
                 accountCooldownMs: config.accountCooldownMs,
                 accountDetails,
                 activeContextsCount: browserManager.contexts.size,
+
                 apiKeySource: config.apiKeySource,
+                autoDisableStatusCodes: config.autoDisableStatusCodes,
                 browserConnected: !!this.serverSystem.connectionRegistry.getConnectionByAuth(currentAuthIndex, false),
                 checkUpdate: config.checkUpdate,
                 currentAccountName,
                 currentAuthIndex,
                 debugMode: LoggingService.isDebugEnabled(),
+                disabledIndicesRaw: disabledIndices,
                 duplicateIndicesRaw: duplicateIndices,
                 enableAuthUpdate: config.enableAuthUpdate,
                 expiredIndicesRaw: expiredIndices,
@@ -1126,6 +1237,7 @@ class StatusRoutes {
                 logMaxCount: limit,
                 maxContexts: config.maxContexts,
                 maxRetries: config.maxRetries,
+                retryDelay: config.retryDelay,
                 rotationIndicesRaw: rotationIndices,
                 safetySettingsThreshold: config.safetySettingsThreshold,
                 streamingMode: config.streamingMode,

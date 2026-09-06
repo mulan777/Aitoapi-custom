@@ -830,28 +830,72 @@
                                         <span v-if="item.index === state.currentAuthIndex" class="current-badge">
                                             {{ t("tagCurrent") }}
                                         </span>
-                                        <span v-if="item.isExpired" class="expired-badge">
+                                        <span
+                                            v-if="item.isDisabled"
+                                            class="disabled-badge"
+                                            :title="item.disabledReason || t('tagDisabled')"
+                                        >
+                                            {{ t("tagDisabled")
+                                            }}<template v-if="item.disabledStatus">
+                                                · {{ item.disabledStatus }}</template
+                                            >
+                                        </span>
+                                        <span v-else-if="item.isExpired" class="expired-badge">
                                             {{ t("tagExpired") }}
                                         </span>
                                         <span v-if="item.route?.cooldownUntil" class="expired-badge">
-                                            {{ t("accountCooldown") }}
-                                        </span>
-                                        <span
-                                            v-else-if="
-                                                item.route?.modelCooldowns &&
-                                                Object.keys(item.route.modelCooldowns).length
-                                            "
-                                            class="expired-badge"
-                                            :title="Object.keys(item.route.modelCooldowns).join(', ')"
-                                        >
-                                            {{ t("accountModelCooldown") }}
+                                            {{ t("accountCooldown") }} ·
+                                            {{ formatCooldownRemaining(item.route.cooldownUntil) }}
                                         </span>
                                         <span v-else-if="item.route?.inFlight > 0" class="current-badge">
                                             {{ t("accountInFlight") }}: {{ item.route.inFlight }}
                                         </span>
+                                        <div v-if="item.route?.cooldownModels?.length" class="account-cooldown-models">
+                                            <span
+                                                v-for="cooldown in item.route.cooldownModels"
+                                                :key="cooldown.model"
+                                                class="cooldown-model-chip"
+                                            >
+                                                {{ cooldown.model }} · {{ formatCooldownRemaining(cooldown.until) }}
+                                            </span>
+                                        </div>
+                                        <div class="account-today-stats">
+                                            <strong>{{ t("todayStats") }}:</strong>
+                                            <span class="today-success"
+                                                >✓ {{ item.todayStats?.successCount || 0 }}</span
+                                            >
+                                            <span class="today-failure"
+                                                >✗ {{ item.todayStats?.failureCount || 0 }}</span
+                                            >
+                                            <span
+                                                v-for="modelStats in (item.todayStats?.models || []).slice(0, 3)"
+                                                :key="modelStats.model"
+                                                class="today-model-stat"
+                                            >
+                                                {{ modelStats.model }} {{ modelStats.successCount }}/{{
+                                                    modelStats.failureCount
+                                                }}
+                                            </span>
+                                            <span
+                                                v-if="(item.todayStats?.models || []).length > 3"
+                                                class="today-model-stat"
+                                                :title="formatTodayModelStats(item.todayStats.models)"
+                                            >
+                                                +{{ item.todayStats.models.length - 3 }}
+                                            </span>
+                                        </div>
                                     </div>
                                 </el-tooltip>
                                 <div class="account-actions">
+                                    <button
+                                        class="btn-disable"
+                                        :class="{ 'is-enable': item.isDisabled }"
+                                        :disabled="isBusy"
+                                        :title="item.isDisabled ? t('enableAccount') : t('disableAccount')"
+                                        @click.stop="toggleAccountEnabled(item)"
+                                    >
+                                        {{ item.isDisabled ? "▶" : "⏸" }}
+                                    </button>
                                     <button
                                         class="btn-test"
                                         :disabled="isBusy || state.testingAccountIndex === item.index"
@@ -1260,6 +1304,60 @@
                                     controls-position="right"
                                     @change="handleMaxContextsChange"
                                 />
+                            </div>
+                            <div class="switch-container">
+                                <span class="label"
+                                    ><span
+                                        >{{ t("maxRetries")
+                                        }}<EnvVarTooltip env-var="MAX_RETRIES" doc-section="proxy-config" /></span
+                                ></span>
+                                <el-input-number
+                                    v-model="state.maxRetries"
+                                    :min="1"
+                                    :max="20"
+                                    :step="1"
+                                    controls-position="right"
+                                    @change="handleMaxRetriesChange"
+                                />
+                            </div>
+                            <div class="switch-container">
+                                <span class="label"
+                                    ><span
+                                        >{{ t("retryDelayMs")
+                                        }}<EnvVarTooltip env-var="RETRY_DELAY" doc-section="proxy-config" /></span
+                                ></span>
+                                <el-input-number
+                                    v-model="state.retryDelay"
+                                    :min="50"
+                                    :max="600000"
+                                    :step="50"
+                                    controls-position="right"
+                                    @change="handleRetryDelayChange"
+                                />
+                            </div>
+                            <div class="switch-container auto-disable-setting">
+                                <span class="label"
+                                    ><span
+                                        >{{ t("autoDisableStatusCodes")
+                                        }}<EnvVarTooltip
+                                            env-var="AUTO_DISABLE_STATUS_CODES"
+                                            doc-section="proxy-config" /></span
+                                ></span>
+                                <el-select
+                                    v-model="state.autoDisableStatusCodes"
+                                    multiple
+                                    filterable
+                                    allow-create
+                                    default-first-option
+                                    @change="handleAutoDisableStatusCodesChange"
+                                >
+                                    <el-option
+                                        v-for="code in [401, 403, 404, 407, 410, 451]"
+                                        :key="code"
+                                        :label="String(code)"
+                                        :value="code"
+                                    />
+                                </el-select>
                             </div>
                             <div class="switch-container">
                                 <span class="label">
@@ -3788,6 +3886,7 @@ const state = reactive({
     accountDetails: [],
     activeContextsCount: 0,
     apiKeySource: "",
+    autoDisableStatusCodes: [401, 403],
     browserConnected: false,
     checkUpdateEnabled: true,
     currentAuthIndex: -1,
@@ -3812,6 +3911,7 @@ const state = reactive({
     maxContexts: 1,
     maxRetries: 3,
     releaseUrl: null,
+    retryDelay: 2000,
     safetySettingsThreshold: "OFF",
     selectedAccounts: new Set(),
     serviceConnected: false,
@@ -4152,6 +4252,42 @@ const getAccountDisplayName = account => {
     return name;
 };
 
+const formatTodayModelStats = models =>
+    (models || []).map(item => `${item.model}: ${item.successCount}/${item.failureCount}`).join("\n");
+
+const formatCooldownRemaining = until => {
+    const remaining = Math.max(0, new Date(until).getTime() - Date.now());
+    if (remaining <= 0) return "0s";
+    const seconds = Math.ceil(remaining / 1000);
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.ceil(seconds / 60);
+    if (minutes < 60) return `${minutes}m`;
+    return `${Math.ceil(minutes / 60)}h`;
+};
+
+const toggleAccountEnabled = async account => {
+    const enabled = Boolean(account.isDisabled);
+    const actionKey = enabled ? "enableAccount" : "disableAccount";
+    try {
+        await ElMessageBox.confirm(t("confirmAccountStateChange", { action: t(actionKey), index: account.index }), {
+            cancelButtonText: t("cancel"),
+            confirmButtonText: t("ok"),
+            type: enabled ? "success" : "warning",
+        });
+        const res = await fetch(`/api/accounts/${account.index}/enabled`, {
+            body: JSON.stringify({ enabled }),
+            headers: { "Content-Type": "application/json" },
+            method: "PUT",
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || data.message || `HTTP ${res.status}`);
+        ElMessage.success(t(data.message || (enabled ? "accountEnableSuccess" : "accountDisableSuccess")));
+        await updateContent();
+    } catch (error) {
+        if (error !== "cancel" && error !== "close") ElMessage.error(error.message || String(error));
+    }
+};
+
 const addUser = () => {
     router.push("/auth");
 };
@@ -4302,6 +4438,28 @@ const handleNumericSettingChange = async (apiUrl, settingName, value) => {
 };
 
 const handleMaxContextsChange = value => handleNumericSettingChange("/api/settings/max-contexts", "maxContexts", value);
+
+const handleMaxRetriesChange = value => handleNumericSettingChange("/api/settings/max-retries", "maxRetries", value);
+const handleRetryDelayChange = value => handleNumericSettingChange("/api/settings/retry-delay", "retryDelay", value);
+const handleAutoDisableStatusCodesChange = async values => {
+    const parsed = [...new Set((values || []).map(value => Number(value)).filter(value => Number.isInteger(value)))];
+    try {
+        const res = await fetch("/api/settings/auto-disable-status-codes", {
+            body: JSON.stringify({ value: parsed }),
+            headers: { "Content-Type": "application/json" },
+            method: "PUT",
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        state.autoDisableStatusCodes = data.value || parsed;
+        ElMessage.success(
+            t("settingUpdateSuccess", { setting: t("autoDisableStatusCodes"), value: parsed.join(", ") })
+        );
+    } catch (error) {
+        ElMessage.error(t("settingFailed", { message: error.message }));
+        await updateContent();
+    }
+};
 
 const handleAccountCooldownChange = value =>
     handleNumericSettingChange("/api/settings/account-cooldown-ms", "accountCooldownMs", value);
@@ -4597,8 +4755,10 @@ const updateStatus = data => {
     state.activeContextsCount = data.status.activeContextsCount || 0;
     state.accountCooldownMaxMs = data.status.accountCooldownMaxMs ?? 1800000;
     state.accountCooldownMs = data.status.accountCooldownMs ?? 300000;
+    state.autoDisableStatusCodes = data.status.autoDisableStatusCodes || [401, 403];
     state.maxContexts = data.status.maxContexts ?? 1;
     state.maxRetries = data.status.maxRetries ?? 3;
+    state.retryDelay = data.status.retryDelay ?? 2000;
     state.safetySettingsThreshold = data.status.safetySettingsThreshold || "OFF";
 
     const validIndices = new Set(state.accountDetails.map(acc => acc.index));
@@ -5641,6 +5801,7 @@ watchEffect(() => {
 .account-info {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: 5px;
     flex: 1;
     min-width: 0;
@@ -5679,6 +5840,52 @@ watchEffect(() => {
     flex-shrink: 0;
     margin-left: 0;
     margin-right: 6px;
+}
+
+.disabled-badge {
+    background: rgba(var(--color-error-rgb), 0.14);
+    border: 1px solid rgba(var(--color-error-rgb), 0.35);
+    border-radius: 999px;
+    color: var(--color-error);
+    font-size: 11px;
+    padding: 1px 7px;
+}
+
+.account-cooldown-models,
+.account-today-stats {
+    display: flex;
+    flex-basis: 100%;
+    flex-wrap: wrap;
+    gap: 4px 8px;
+    margin-top: 5px;
+}
+.cooldown-model-chip {
+    background: rgba(var(--color-warning-rgb), 0.14);
+    border-radius: 999px;
+    color: var(--color-warning);
+    font-size: 11px;
+    padding: 2px 7px;
+}
+.account-today-stats {
+    color: var(--text-secondary);
+    font-size: 11px;
+}
+.today-success {
+    color: var(--color-success);
+}
+.today-failure {
+    color: var(--color-error);
+}
+.today-model-stat {
+    background: var(--bg-secondary);
+    border-radius: 4px;
+    padding: 1px 5px;
+}
+.btn-disable.is-enable {
+    color: var(--color-success);
+}
+.auto-disable-setting :deep(.el-select) {
+    width: 240px;
 }
 
 .expired-badge {

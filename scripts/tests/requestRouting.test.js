@@ -1,5 +1,7 @@
 const assert = require("assert");
+const BrowserManager = require("../../src/core/BrowserManager");
 const RequestHandler = require("../../src/core/RequestHandler");
+const UsageStatsService = require("../../src/core/UsageStatsService");
 
 const makeHandler = () => {
     const connections = new Map([
@@ -38,9 +40,11 @@ const makeHandler = () => {
     handler.accountRouteState = new Map();
     handler.pendingUsageRotations = new Set();
     handler.usageRotationPromise = null;
+    handler.accountDisableCleanup = new Map();
     handler.config = {
         accountCooldownMaxMs: 30000,
         accountCooldownMs: 1000,
+        autoDisableStatusCodes: [401, 403],
         failureThreshold: 1,
         immediateSwitchStatusCodes: [429, 503],
     };
@@ -133,10 +137,123 @@ const testExpiredAndRemovedAccountsAreNotRouted = () => {
     handler.authSource = {
         availableIndices: [0, 1],
         isExpired: index => index === 1,
+        isUnavailable: index => index === 1,
     };
     assert.strictEqual(handler._selectRequestAuthIndex(), 0);
     handler.authSource.availableIndices = [1];
     assert.strictEqual(handler._selectRequestAuthIndex(), -1);
+};
+
+const testConfiguredStatusAutoDisablesAccount = async () => {
+    const { handler } = makeHandler();
+    let disabled = null;
+    handler.authSource = {
+        availableIndices: [0, 1],
+        disableAuth: async (index, metadata) => {
+            disabled = { index, metadata };
+            return true;
+        },
+        disabledIndices: [],
+        isDisabled: () => false,
+        isUnavailable: () => false,
+    };
+    handler.browserManager = { closeContext: async () => {} };
+    handler.connectionRegistry.closeMessageQueuesForAuth = () => {};
+    handler._autoDisableAccountForStatus(0, { status: 403 });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.strictEqual(disabled.index, 0);
+    assert.strictEqual(disabled.metadata.status, 403);
+};
+
+const testAutoDisableCleanupIsSingleFlight = async () => {
+    const { handler } = makeHandler();
+    let closeCount = 0;
+    let disableCount = 0;
+    handler.authSource = {
+        availableIndices: [0, 1],
+        disableAuth: async index => {
+            disableCount += 1;
+            handler.authSource.disabledIndices.push(index);
+            return true;
+        },
+        disabledIndices: [],
+        isDisabled: index => handler.authSource.disabledIndices.includes(index),
+        isUnavailable: index => handler.authSource.disabledIndices.includes(index),
+    };
+    handler.browserManager = {
+        async _withContextPoolMutation(task) {
+            return task();
+        },
+        async closeContext() {
+            closeCount += 1;
+        },
+        async launchOrSwitchContext() {},
+        async rebalanceContextPool() {},
+    };
+    handler.connectionRegistry.closeMessageQueuesForAuth = () => {};
+    handler.connectionRegistry.closeConnectionByAuth = () => {};
+    handler._selectRequestAuthIndex = () => -1;
+
+    handler._autoDisableAccountForStatus(0, { status: 403 });
+    handler._autoDisableAccountForStatus(0, { status: 403 });
+    await handler.accountDisableCleanup.get(0);
+
+    assert.strictEqual(disableCount, 1);
+    assert.strictEqual(closeCount, 1);
+};
+
+const testAlreadyDisabledAccountStillGetsCleanup = async () => {
+    const { handler } = makeHandler();
+    let closeCount = 0;
+    handler.authSource = {
+        availableIndices: [0, 1],
+        disableAuth: async () => {
+            throw new Error("should not rewrite an already disabled credential");
+        },
+        isDisabled: () => true,
+        isUnavailable: () => true,
+    };
+    handler.browserManager = {
+        async _withContextPoolMutation(task) {
+            return task();
+        },
+        async closeContext() {
+            closeCount += 1;
+        },
+        async rebalanceContextPool() {},
+    };
+    handler.connectionRegistry.closeMessageQueuesForAuth = () => {};
+    handler.connectionRegistry.closeConnectionByAuth = () => {};
+    handler._selectRequestAuthIndex = () => -1;
+
+    handler._autoDisableAccountForStatus(0, { status: 403 });
+    await handler.accountDisableCleanup.get(0);
+    assert.strictEqual(closeCount, 1);
+};
+
+const testTodayAccountModelStats = () => {
+    const service = Object.create(UsageStatsService.prototype);
+    service.enabled = true;
+    const now = new Date();
+    const yesterday = new Date(now.getTime() - 86400000);
+    service.records = [
+        { finalAuthIndex: 7, finishedAt: now.toISOString(), model: "gemini-a", outcome: "success" },
+        { finalAuthIndex: 7, finishedAt: now.toISOString(), model: "gemini-a", outcome: "error" },
+        { finalAuthIndex: 7, finishedAt: now.toISOString(), model: "gemini-b", outcome: "success" },
+        { finalAuthIndex: 7, finishedAt: yesterday.toISOString(), model: "gemini-a", outcome: "error" },
+    ];
+    const stats = service.getTodayAccountStats(now)["7"];
+    assert.strictEqual(stats.successCount, 2);
+    assert.strictEqual(stats.failureCount, 1);
+    assert.deepStrictEqual(
+        stats.models.find(item => item.model === "gemini-a"),
+        {
+            failureCount: 1,
+            model: "gemini-a",
+            successCount: 1,
+            totalCount: 2,
+        }
+    );
 };
 
 const testForwardUsesSelectedAccount = () => {
@@ -194,6 +311,29 @@ const testReadyCheckMovesQueuedRequestOffCooldownAccount = async () => {
     assert.strictEqual(handler._getRequestAuthIndex("request-5"), 1);
 };
 
+const testAtomicContextReplacementOrdersReadyBeforeClose = async () => {
+    const events = [];
+    const manager = Object.create(BrowserManager.prototype);
+    manager.contexts = new Map([[0, {}]]);
+    manager.ensureContextForAuth = async authIndex => {
+        events.push(`ready:${authIndex}`);
+        manager.contexts.set(authIndex, { context: {}, page: {} });
+        return true;
+    };
+    manager._closeContextForPoolIfPossible = async authIndex => {
+        events.push(`close:${authIndex}`);
+        manager.contexts.delete(authIndex);
+        return true;
+    };
+    manager.logger = { info() {} };
+    manager._activateContext = () => {};
+
+    const replaced = await manager.replaceContextForAuth(0, 5, { reason: "test" });
+    assert.strictEqual(replaced, true);
+    assert.deepStrictEqual(events, ["ready:5", "close:0"]);
+    assert.strictEqual(manager.contexts.has(5), true);
+};
+
 const testPerAccountUsageRotation = async () => {
     const { handler, connections } = makeHandler();
     handler.config.maxContexts = 5;
@@ -202,6 +342,7 @@ const testPerAccountUsageRotation = async () => {
         availableIndices: [0, 1, 2, 3, 4, 5],
         getRotationIndices: () => [0, 1, 2, 3, 4, 5],
         isExpired: () => false,
+        isUnavailable: () => false,
     };
     handler.browserManager = {
         async closeContext(authIndex) {
@@ -217,10 +358,12 @@ const testPerAccountUsageRotation = async () => {
         ]),
         async ensureContextForAuth(authIndex) {
             this.contexts.set(authIndex, {});
-            connections.set(authIndex, {
-                readyState: 1,
-                send() {},
-            });
+            connections.set(authIndex, { readyState: 1, send() {} });
+            return true;
+        },
+        async replaceContextForAuth(sourceAuthIndex, targetAuthIndex) {
+            await this.ensureContextForAuth(targetAuthIndex);
+            await this.closeContext(sourceAuthIndex);
             return true;
         },
     };
@@ -241,6 +384,26 @@ const testPerAccountUsageRotation = async () => {
     assert.strictEqual(handler._selectRequestAuthIndex([], null), 1);
 };
 
+const testUsageThresholdFallsBackToHealthySingleAccount = async () => {
+    const { handler, connections } = makeHandler();
+    handler.config.maxContexts = 5;
+    handler.config.switchOnUses = 1;
+    handler.authSource = {
+        availableIndices: [0],
+        getRotationIndices: () => [0],
+        isUnavailable: () => false,
+    };
+    handler.browserManager = { contexts: new Map([[0, {}]]) };
+    handler._bindRequestAuthIndex("single-account", 0);
+    handler._incrementGenerationUsage("single-account", 0, "test generation");
+    handler._releaseRequestAuthIndex("single-account");
+    await handler._flushPendingUsageRotations();
+
+    assert.strictEqual(handler.getAccountRouteStatus(0).usageCount, 0);
+    assert.strictEqual(handler.getAccountRouteStatus(0).usageExhausted, false);
+    assert.strictEqual(connections.get(0).readyState, 1);
+};
+
 (async () => {
     testRoundRobinAndBinding();
     await testFailureDoesNotGloballySwitch();
@@ -251,10 +414,16 @@ const testPerAccountUsageRotation = async () => {
     testSuccessResetsTransientFailureState();
     testExpiredAndRemovedAccountsAreNotRouted();
     testModelNormalization();
+    await testConfiguredStatusAutoDisablesAccount();
+    await testAutoDisableCleanupIsSingleFlight();
+    await testAlreadyDisabledAccountStillGetsCleanup();
+    testTodayAccountModelStats();
     testForwardUsesSelectedAccount();
     await testAccountTestPreservesActiveCooldown();
     await testReadyCheckMovesQueuedRequestOffCooldownAccount();
+    await testAtomicContextReplacementOrdersReadyBeforeClose();
     await testPerAccountUsageRotation();
+    await testUsageThresholdFallsBackToHealthySingleAccount();
     console.log("request routing tests: PASS");
 })().catch(error => {
     console.error(error.stack || error.message);
