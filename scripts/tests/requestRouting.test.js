@@ -112,22 +112,11 @@ const testModelNormalization = () => {
     assert.strictEqual(handler._normalizeRouteModel("/gemini-3.7-flash(high)"), "gemini-3.7-flash");
 };
 
-
 const testModel429HelperQuarantinesOnlyModel = () => {
     const { handler } = makeHandler();
-    handler._markImmediateRateLimitIfNeeded(
-        0,
-        "gemini-3.8-flash",
-        { message: "quota", status: 429 }
-    );
-    assert.strictEqual(
-        handler._selectRequestAuthIndex([1], "gemini-3.8-flash"),
-        -1
-    );
-    assert.strictEqual(
-        handler._selectRequestAuthIndex([1], "gemini-3.7-flash"),
-        0
-    );
+    handler._markImmediateRateLimitIfNeeded(0, "gemini-3.8-flash", { message: "quota", status: 429 });
+    assert.strictEqual(handler._selectRequestAuthIndex([1], "gemini-3.8-flash"), -1);
+    assert.strictEqual(handler._selectRequestAuthIndex([1], "gemini-3.7-flash"), 0);
 };
 
 const testSuccessResetsTransientFailureState = () => {
