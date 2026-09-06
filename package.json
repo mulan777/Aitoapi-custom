@@ -1,6 +1,6 @@
 {
     "name": "aitoapi-custom",
-    "version": "1.3.6",
+    "version": "1.2.0",
     "author": "Ellinav, iBenzene, bbbugg",
     "description": "Encapsulate Gemini models on AI Studio as API services.",
     "main": "main.js",
