@@ -113,6 +113,13 @@ class RequestHandler {
             .map(([authIndex]) => authIndex)
             .filter(authIndex => {
                 if (excludedSet.has(authIndex)) return false;
+                if (
+                    Array.isArray(this.authSource?.availableIndices) &&
+                    !this.authSource.availableIndices.includes(authIndex)
+                ) {
+                    return false;
+                }
+                if (this.authSource?.isExpired?.(authIndex)) return false;
                 const routeState = this.accountRouteState.get(authIndex);
                 if (routeState?.cooldownUntil > now) return false;
                 return !routeModel || (routeState?.modelCooldowns?.[routeModel] || 0) <= now;
@@ -127,6 +134,9 @@ class RequestHandler {
                 Number.isInteger(current) &&
                 current >= 0 &&
                 !excludedSet.has(current) &&
+                (!Array.isArray(this.authSource?.availableIndices) ||
+                    this.authSource.availableIndices.includes(current)) &&
+                !this.authSource?.isExpired?.(current) &&
                 currentConnection &&
                 currentConnection.readyState === 1 &&
                 (!currentState?.cooldownUntil || currentState.cooldownUntil <= now) &&
@@ -223,6 +233,18 @@ class RequestHandler {
             state.rateLimitHits = 0;
         }
         if (state.cooldownUntil && state.cooldownUntil <= Date.now()) state.cooldownUntil = 0;
+        // Failure thresholds represent consecutive/transient failures. A successful
+        // request on this account proves that the previous failure streak is over.
+        this.requestFailureCounts.delete(authIndex);
+        if (this.authSwitcher?.failureCount > 0) {
+            this.authSwitcher.failureCount = 0;
+        }
+    }
+
+    _markImmediateRateLimitIfNeeded(authIndex, modelName, errorDetails) {
+        if (Number(errorDetails?.status) === 429) {
+            this._markAccount429ForModel(authIndex, modelName, errorDetails);
+        }
     }
 
     getAccountRouteStatus(authIndex) {
@@ -277,7 +299,21 @@ class RequestHandler {
             // not move the global UI account or disturb another request.
             let contextData = this.browserManager.contexts.get(authIndex);
             if (!contextData) {
-                await this.browserManager.launchOrSwitchContext(authIndex);
+                if (typeof this.browserManager.ensureContextForAuth === "function") {
+                    const warmed = await this.browserManager.ensureContextForAuth(authIndex);
+                    if (!warmed) {
+                        return {
+                            authIndex,
+                            connected: false,
+                            hasContext: false,
+                            message: "Account could not be warmed without evicting a busy context.",
+                            status: 503,
+                            success: false,
+                        };
+                    }
+                } else {
+                    await this.browserManager.launchOrSwitchContext(authIndex);
+                }
                 contextData = this.browserManager.contexts.get(authIndex);
             }
             const connection = this.connectionRegistry.getConnectionByAuth(authIndex, false);
@@ -1789,6 +1825,11 @@ class RequestHandler {
                             this.logger.warn(
                                 `[Request] OpenAI real stream received ${initialStatus}, preparing retry...`
                             );
+                            this._markImmediateRateLimitIfNeeded(
+                                currentQueueAuthIndex,
+                                this._getProxyRequestModel(proxyRequest),
+                                initialMessage
+                            );
                             this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
 
                             const retryPrepared = await this._prepareImmediateStatusRetry(
@@ -2204,6 +2245,11 @@ class RequestHandler {
                             this.logger.warn(
                                 `[Request] OpenAI Response API real stream received ${initialStatus}, preparing retry...`
                             );
+                            this._markImmediateRateLimitIfNeeded(
+                                currentQueueAuthIndex,
+                                this._getProxyRequestModel(proxyRequest),
+                                initialMessage
+                            );
                             this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
 
                             const retryPrepared = await this._prepareImmediateStatusRetry(
@@ -2587,6 +2633,11 @@ class RequestHandler {
                         ) {
                             this.logger.warn(
                                 `[Request] Claude real stream received ${initialStatus}, preparing retry...`
+                            );
+                            this._markImmediateRateLimitIfNeeded(
+                                currentQueueAuthIndex,
+                                this._getProxyRequestModel(proxyRequest),
+                                initialMessage
                             );
                             this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
 
@@ -3559,6 +3610,11 @@ class RequestHandler {
                 this.config?.immediateSwitchStatusCodes?.includes(headerStatus)
             ) {
                 this.logger.warn(`[Request] Gemini real stream received ${headerStatus}, preparing retry...`);
+                this._markImmediateRateLimitIfNeeded(
+                    currentQueueAuthIndex,
+                    this._getProxyRequestModel(proxyRequest),
+                    headerMessage
+                );
                 this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
 
                 const retryPrepared = await this._prepareImmediateStatusRetry(
