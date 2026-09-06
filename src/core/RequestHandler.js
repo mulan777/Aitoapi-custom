@@ -46,6 +46,9 @@ class RequestHandler {
         this.requestRouteCursor = 0;
         this.requestFailureCounts = new Map();
         this.accountRouteState = new Map();
+        this.pendingUsageRotations = new Set();
+        this.usageRotationPromise = null;
+        this.usageRotationRetryTimer = null;
 
         // Timeout settings
         this.timeouts = {
@@ -93,7 +96,11 @@ class RequestHandler {
 
         for (const authIndex of candidates) {
             const state = this._getAccountRouteState(authIndex);
-            if (state.cooldownUntil > Date.now() || (state.modelCooldowns?.[routeModel] || 0) > Date.now()) {
+            if (
+                state.cooldownUntil > Date.now() ||
+                state.usageExhausted ||
+                (state.modelCooldowns?.[routeModel] || 0) > Date.now()
+            ) {
                 continue;
             }
             if (await this.browserManager.ensureContextForAuth(authIndex)) {
@@ -115,6 +122,7 @@ class RequestHandler {
                 if (excludedSet.has(authIndex)) return false;
                 const routeState = this.accountRouteState.get(authIndex);
                 if (routeState?.cooldownUntil > now) return false;
+                if (this._isPerAccountUsageRoutingEnabled() && routeState?.usageExhausted) return false;
                 return !routeModel || (routeState?.modelCooldowns?.[routeModel] || 0) <= now;
             })
             .sort((a, b) => a - b);
@@ -130,6 +138,7 @@ class RequestHandler {
                 currentConnection &&
                 currentConnection.readyState === 1 &&
                 (!currentState?.cooldownUntil || currentState.cooldownUntil <= now) &&
+                (!this._isPerAccountUsageRoutingEnabled() || !currentState?.usageExhausted) &&
                 (!routeModel || (currentState?.modelCooldowns?.[routeModel] || 0) <= now);
             return currentAvailable ? current : -1;
         }
@@ -154,6 +163,9 @@ class RequestHandler {
                 modelCooldowns: {},
                 modelRateLimitHits: {},
                 rateLimitHits: 0,
+                usageCount: 0,
+                usageExhausted: false,
+                usageExhaustedAt: 0,
             };
         }
         if (!this.accountRouteState.has(authIndex)) {
@@ -165,9 +177,227 @@ class RequestHandler {
                 modelCooldowns: {},
                 modelRateLimitHits: {},
                 rateLimitHits: 0,
+                usageCount: 0,
+                usageExhausted: false,
+                usageExhaustedAt: 0,
             });
         }
         return this.accountRouteState.get(authIndex);
+    }
+
+    _isPerAccountUsageRoutingEnabled() {
+        return this.config.maxContexts === 0 || this.config.maxContexts > 1;
+    }
+
+    _incrementGenerationUsage(requestId, fallbackAuthIndex, label) {
+        const authIndex = this._getRequestAuthIndex(requestId, fallbackAuthIndex);
+        if (authIndex < 0) {
+            return { authIndex, count: 0, exhausted: false, limit: this.config.switchOnUses };
+        }
+
+        if (!this._isPerAccountUsageRoutingEnabled()) {
+            const count = this.authSwitcher.incrementUsageCount();
+            if (this.authSwitcher.shouldSwitchByUsage() && this._shouldRotateGlobalAccount()) {
+                this.needsSwitchingAfterRequest = true;
+            }
+            return {
+                authIndex,
+                count,
+                exhausted: this.authSwitcher.shouldSwitchByUsage(),
+                limit: this.config.switchOnUses,
+                mode: "global",
+            };
+        }
+
+        const state = this._getAccountRouteState(authIndex);
+        state.usageCount += 1;
+        const limit = Number(this.config.switchOnUses) || 0;
+        if (limit > 0 && state.usageCount >= limit) {
+            if (!state.usageExhausted) {
+                state.usageExhausted = true;
+                state.usageExhaustedAt = Date.now();
+                this.pendingUsageRotations.add(authIndex);
+                this.logger.info(
+                    `[Routing] Account #${authIndex} reached usage threshold ` +
+                        `(${state.usageCount}/${limit}) for ${label}; it will be replaced after in-flight requests drain.`
+                );
+            }
+        }
+
+        this.logger.info(
+            `[Request] ${label} routed through account #${authIndex}: ` +
+                `${limit > 0 ? `${state.usageCount}/${limit}` : state.usageCount}`
+        );
+        return {
+            authIndex,
+            count: state.usageCount,
+            exhausted: state.usageExhausted,
+            limit,
+            mode: "per-account",
+        };
+    }
+
+    _getUsageRotationCandidates(sourceAuthIndex) {
+        const rotation = this.authSource?.getRotationIndices?.() ||
+            this.authSource?.availableIndices || [...this.connectionRegistry.getAllConnections().keys()];
+        const ordered = Array.isArray(rotation) ? [...rotation] : [];
+        if (ordered.length === 0) return [];
+
+        const sourcePosition = ordered.indexOf(sourceAuthIndex);
+        const start = sourcePosition >= 0 ? sourcePosition + 1 : 0;
+        const candidates = [];
+        const seen = new Set();
+        const now = Date.now();
+
+        for (let offset = 0; offset < ordered.length; offset++) {
+            const authIndex = ordered[(start + offset) % ordered.length];
+            if (seen.has(authIndex) || authIndex === sourceAuthIndex) continue;
+            seen.add(authIndex);
+
+            if (this.authSource?.isExpired?.(authIndex)) continue;
+            const state = this._getAccountRouteState(authIndex);
+            if (state.cooldownUntil > now || state.usageExhausted) continue;
+            candidates.push(authIndex);
+        }
+
+        return candidates;
+    }
+
+    _resetExhaustedUsageCycle() {
+        const rotation = this.authSource?.getRotationIndices?.() ||
+            this.authSource?.availableIndices || [...this.accountRouteState.keys()];
+        let resetCount = 0;
+        for (const authIndex of Array.isArray(rotation) ? rotation : []) {
+            const state = this._getAccountRouteState(authIndex);
+            if (!state.usageExhausted) continue;
+            state.usageCount = 0;
+            state.usageExhausted = false;
+            state.usageExhaustedAt = 0;
+            resetCount += 1;
+        }
+        if (resetCount > 0) {
+            this.logger.info(`[Routing] All usable accounts reached the usage threshold; started a new cycle.`);
+        }
+        return resetCount;
+    }
+
+    async _rotateAccountAfterUsage(sourceAuthIndex) {
+        if (!this._isPerAccountUsageRoutingEnabled()) return false;
+
+        const sourceState = this._getAccountRouteState(sourceAuthIndex);
+        if (!sourceState.usageExhausted || sourceState.inFlight > 0) return false;
+        const wasCurrent = this.browserManager?.currentAuthIndex === sourceAuthIndex;
+
+        let candidates = this._getUsageRotationCandidates(sourceAuthIndex);
+        if (candidates.length === 0) {
+            this._resetExhaustedUsageCycle();
+            candidates = this._getUsageRotationCandidates(sourceAuthIndex);
+        }
+        if (candidates.length === 0) {
+            this.logger.warn(
+                `[Routing] No replacement account is available for exhausted account #${sourceAuthIndex}.`
+            );
+            return false;
+        }
+
+        const hasContext = authIndex => this.browserManager?.contexts?.has(authIndex);
+        const coldCandidates = candidates.filter(authIndex => !hasContext(authIndex));
+        const activeCandidates = candidates.filter(authIndex =>
+            this.connectionRegistry.getConnectionByAuth(authIndex, false)
+        );
+        const orderedCandidates = [...coldCandidates, ...activeCandidates, ...candidates].filter(
+            (authIndex, index, list) => list.indexOf(authIndex) === index
+        );
+
+        // Free the exhausted slot first.  The request binding has already been
+        // released by the caller, so closeContext will not interrupt the
+        // request that caused the threshold to be reached.
+        if (this.browserManager?.contexts?.has(sourceAuthIndex)) {
+            await this.browserManager.closeContext(sourceAuthIndex);
+        }
+
+        const activateIfNeeded = async targetAuthIndex => {
+            if (!wasCurrent || !this.browserManager?.launchOrSwitchContext) return true;
+            try {
+                await this.browserManager.launchOrSwitchContext(targetAuthIndex);
+                return this.browserManager.currentAuthIndex === targetAuthIndex;
+            } catch (error) {
+                this.logger.warn(
+                    `[Routing] Failed to make replacement account #${targetAuthIndex} current: ${error.message}`
+                );
+                return false;
+            }
+        };
+
+        for (const targetAuthIndex of orderedCandidates) {
+            if (this.browserManager?.contexts?.has(targetAuthIndex)) {
+                if (await activateIfNeeded(targetAuthIndex)) {
+                    this.logger.info(
+                        `[Routing] Replaced exhausted account #${sourceAuthIndex} with warm account #${targetAuthIndex}.`
+                    );
+                    return true;
+                }
+                continue;
+            }
+
+            if (this.browserManager?.ensureContextForAuth) {
+                const warmed = await this.browserManager.ensureContextForAuth(targetAuthIndex);
+                if (warmed && (await activateIfNeeded(targetAuthIndex))) {
+                    this.logger.info(
+                        `[Routing] Replaced exhausted account #${sourceAuthIndex} with account #${targetAuthIndex}; ` +
+                            `context warmed and WebSocket connected.`
+                    );
+                    return true;
+                }
+            }
+        }
+
+        this.logger.warn(`[Routing] Replacement warm-up failed for exhausted account #${sourceAuthIndex}.`);
+        return false;
+    }
+
+    async _flushPendingUsageRotations() {
+        if (!this._isPerAccountUsageRoutingEnabled() || this.pendingUsageRotations.size === 0) return;
+
+        for (const authIndex of [...this.pendingUsageRotations]) {
+            const state = this._getAccountRouteState(authIndex);
+            if (!state.usageExhausted) {
+                this.pendingUsageRotations.delete(authIndex);
+                continue;
+            }
+            if (state.inFlight > 0) continue;
+
+            const rotated = await this._rotateAccountAfterUsage(authIndex);
+            if (rotated) this.pendingUsageRotations.delete(authIndex);
+        }
+    }
+
+    _schedulePendingUsageRotations() {
+        if (
+            !this._isPerAccountUsageRoutingEnabled() ||
+            this.pendingUsageRotations.size === 0 ||
+            this.usageRotationPromise ||
+            this.usageRotationRetryTimer
+        ) {
+            return;
+        }
+
+        this.usageRotationPromise = this._flushPendingUsageRotations()
+            .catch(error => {
+                this.logger.error(`[Routing] Pending usage rotation failed: ${error.message}`);
+            })
+            .finally(() => {
+                this.usageRotationPromise = null;
+                if (this.pendingUsageRotations.size > 0) {
+                    // Warm-up failures are usually transient. Delay the next
+                    // attempt so an unavailable browser/auth source cannot
+                    // create a synchronous promise loop.
+                    this.usageRotationRetryTimer = setTimeout(() => {
+                        this.usageRotationRetryTimer = null;
+                        this._schedulePendingUsageRotations();
+                    }, 2000);
+                }
+            });
     }
 
     _parseRetryAfterMs(errorDetails) {
@@ -236,6 +466,9 @@ class RequestHandler {
                 Object.entries(state.modelCooldowns || {}).filter(([, until]) => until > Date.now())
             ),
             rateLimitHits: state.rateLimitHits,
+            usageCount: state.usageCount,
+            usageExhausted: state.usageExhausted,
+            usageLimit: Number(this.config.switchOnUses) || 0,
         };
     }
 
@@ -344,6 +577,9 @@ class RequestHandler {
         if (Number.isInteger(authIndex) && authIndex >= 0) {
             const state = this._getAccountRouteState(authIndex);
             state.inFlight = Math.max(0, state.inFlight - 1);
+            if (state.inFlight === 0 && state.usageExhausted) {
+                this._schedulePendingUsageRotations();
+            }
         }
         this.requestAuthBindings.delete(requestId);
         this.requestModelBindings.delete(requestId);
@@ -1045,7 +1281,13 @@ class RequestHandler {
         // quarantine immediately before touching the browser connection.
         const targetRouteState = this._getAccountRouteState(targetAuthIndex);
         const targetModelCooldownUntil = routeModel ? targetRouteState.modelCooldowns?.[routeModel] || 0 : 0;
-        if (targetRouteState.cooldownUntil > Date.now() || targetModelCooldownUntil > Date.now()) {
+        const targetUsageExhausted =
+            this._isPerAccountUsageRoutingEnabled() && targetRouteState.usageExhausted === true;
+        if (
+            targetRouteState.cooldownUntil > Date.now() ||
+            targetModelCooldownUntil > Date.now() ||
+            targetUsageExhausted
+        ) {
             const replacementAuthIndex = this._selectRequestAuthIndex([targetAuthIndex], routeModel);
             if (replacementAuthIndex >= 0) {
                 targetAuthIndex = replacementAuthIndex;
@@ -1057,6 +1299,17 @@ class RequestHandler {
                     targetAuthIndex = warmedAuthIndex;
                     this._bindRequestAuthIndex(requestId, warmedAuthIndex);
                     return this._ensureBrowserBackedRequestReady(res, options);
+                }
+                if (targetUsageExhausted) {
+                    this._schedulePendingUsageRotations();
+                    this._sendErrorResponse(
+                        res,
+                        503,
+                        "Account pool is rotating; no fresh account connection is ready yet.",
+                        waitErrorType
+                    );
+                    this._markTrackedEarlyExitIfNeeded(res, "Account usage threshold reached while pool was rotating.");
+                    return false;
                 }
                 const cooldownMs = this.getNextCooldownMs(routeModel);
                 res.setHeader("Retry-After", Math.max(1, Math.ceil(cooldownMs / 1000)));
@@ -1431,17 +1684,7 @@ class RequestHandler {
                 (req.path.includes("generateContent") || req.path.includes("streamGenerateContent"));
 
             if (isGenerativeRequest) {
-                const usageCount = this.authSwitcher.incrementUsageCount();
-                if (usageCount > 0) {
-                    const rotationCountText =
-                        this.config.switchOnUses > 0 ? `${usageCount}/${this.config.switchOnUses}` : `${usageCount}`;
-                    this.logger.info(
-                        `[Request] Google generation request - account rotation count: ${rotationCountText} (Current account: ${this.currentAuthIndex}), request ID: ${requestId}`
-                    );
-                    if (this.authSwitcher.shouldSwitchByUsage() && this._shouldRotateGlobalAccount()) {
-                        this.needsSwitchingAfterRequest = true;
-                    }
-                }
+                this._incrementGenerationUsage(requestId, requestAuthIndex, "Google generation request");
             }
 
             const proxyRequest = this._buildProxyRequest(req, requestId);
@@ -1502,6 +1745,7 @@ class RequestHandler {
         } finally {
             this._releaseRequestAuthIndex(requestId);
             this._finalizeTrackedRequest(requestId, res);
+            this._schedulePendingUsageRotations();
         }
     }
 
@@ -1700,18 +1944,8 @@ class RequestHandler {
             const isOpenAIStream = req.body.stream === true;
             const systemStreamMode = this.config.streamingMode;
 
-            // Handle usage counting
-            const usageCount = this.authSwitcher.incrementUsageCount();
-            if (usageCount > 0) {
-                const rotationCountText =
-                    this.config.switchOnUses > 0 ? `${usageCount}/${this.config.switchOnUses}` : `${usageCount}`;
-                this.logger.info(
-                    `[Request] OpenAI generation request - account rotation count: ${rotationCountText} (Current account: ${this.currentAuthIndex}), request ID: ${requestId}`
-                );
-                if (this.authSwitcher.shouldSwitchByUsage() && this._shouldRotateGlobalAccount()) {
-                    this.needsSwitchingAfterRequest = true;
-                }
-            }
+            // Handle usage counting per assigned account in multi-context mode.
+            this._incrementGenerationUsage(requestId, requestAuthIndex, "OpenAI generation request");
 
             // Translate OpenAI format to Google format (also handles model name suffix parsing)
             let googleBody, model, modelStreamingMode;
@@ -2029,6 +2263,7 @@ class RequestHandler {
         } finally {
             this._releaseRequestAuthIndex(requestId);
             this._finalizeTrackedRequest(requestId, res);
+            this._schedulePendingUsageRotations();
         }
     }
 
@@ -2109,18 +2344,8 @@ class RequestHandler {
             );
             const systemStreamMode = this.config.streamingMode;
 
-            // Handle usage counting
-            const usageCount = this.authSwitcher.incrementUsageCount();
-            if (usageCount > 0) {
-                const rotationCountText =
-                    this.config.switchOnUses > 0 ? `${usageCount}/${this.config.switchOnUses}` : `${usageCount}`;
-                this.logger.info(
-                    `[Request] OpenAI Response generation request - account rotation count: ${rotationCountText} (Current account: ${this.currentAuthIndex}), request ID: ${requestId}`
-                );
-                if (this.authSwitcher.shouldSwitchByUsage() && this._shouldRotateGlobalAccount()) {
-                    this.needsSwitchingAfterRequest = true;
-                }
-            }
+            // Handle usage counting per assigned account in multi-context mode.
+            this._incrementGenerationUsage(requestId, requestAuthIndex, "OpenAI Response generation request");
 
             // Translate OpenAI Response format to Google format
             let googleBody, model, modelStreamingMode;
@@ -2467,6 +2692,7 @@ class RequestHandler {
         } finally {
             this._releaseRequestAuthIndex(requestId);
             this._finalizeTrackedRequest(requestId, res);
+            this._schedulePendingUsageRotations();
         }
     }
 
@@ -2498,18 +2724,8 @@ class RequestHandler {
             const isClaudeStream = req.body.stream === true;
             const systemStreamMode = this.config.streamingMode;
 
-            // Handle usage counting
-            const usageCount = this.authSwitcher.incrementUsageCount();
-            if (usageCount > 0) {
-                const rotationCountText =
-                    this.config.switchOnUses > 0 ? `${usageCount}/${this.config.switchOnUses}` : `${usageCount}`;
-                this.logger.info(
-                    `[Request] Claude generation request - account rotation count: ${rotationCountText} (Current account: ${this.currentAuthIndex}), request ID: ${requestId}`
-                );
-                if (this.authSwitcher.shouldSwitchByUsage() && this._shouldRotateGlobalAccount()) {
-                    this.needsSwitchingAfterRequest = true;
-                }
-            }
+            // Handle usage counting per assigned account in multi-context mode.
+            this._incrementGenerationUsage(requestId, requestAuthIndex, "Claude generation request");
 
             // Translate Claude format to Google format
             let googleBody, model, modelStreamingMode;
@@ -2817,6 +3033,7 @@ class RequestHandler {
         } finally {
             this._releaseRequestAuthIndex(requestId);
             this._finalizeTrackedRequest(requestId, res);
+            this._schedulePendingUsageRotations();
         }
     }
 
@@ -4181,12 +4398,44 @@ class RequestHandler {
 
     async _streamOpenAIResponse(messageQueue, res, model, requestId) {
         const streamState = {};
+        let sawNormalFinish = false;
+        let dataChunkCount = 0;
 
         try {
             // eslint-disable-next-line no-constant-condition
             while (true) {
                 const message = await messageQueue.dequeue(this.timeouts.STREAM_CHUNK);
                 if (message.type === "STREAM_END") {
+                    this.logger.info(
+                        `[Request] Upstream stream end received (normal finishReason: ${
+                            sawNormalFinish ? "yes" : "no"
+                        }, chunks: ${dataChunkCount}), request ID: ${requestId}`
+                    );
+                    if (!sawNormalFinish) {
+                        const incompleteError = new Error(
+                            "Upstream stream ended before a normal finishReason was received; partial response is incomplete."
+                        );
+                        incompleteError.status = 502;
+                        this._markTrackedResponseError(res, incompleteError.message, incompleteError.status);
+                        if (this._isResponseWritable(res)) {
+                            try {
+                                res.write(
+                                    `data: ${JSON.stringify({
+                                        error: {
+                                            code: incompleteError.status,
+                                            message: incompleteError.message,
+                                            type: "incomplete_stream_error",
+                                        },
+                                    })}\n\n`
+                                );
+                            } catch (writeError) {
+                                this.logger.debug(
+                                    `[Request] Failed to write incomplete-stream error: ${writeError.message}`
+                                );
+                            }
+                        }
+                        break;
+                    }
                     if (this._isResponseWritable(res)) {
                         try {
                             res.write("data: [DONE]\n\n");
@@ -4220,6 +4469,20 @@ class RequestHandler {
                 }
 
                 if (message.data) {
+                    dataChunkCount += 1;
+                    try {
+                        const parsedChunk = JSON.parse(message.data.replace(/^data:\s*/, "").trim());
+                        const candidate = parsedChunk?.candidates?.[0];
+                        if (candidate?.finishReason) {
+                            sawNormalFinish = true;
+                            this.logger.info(
+                                `[Request] Upstream finishReason=${candidate.finishReason} received ` +
+                                    `(chunks: ${dataChunkCount}), request ID: ${requestId}`
+                            );
+                        }
+                    } catch {
+                        // A fragmented/non-JSON chunk is passed to the normal converter.
+                    }
                     const openAIChunk = this.formatConverter.translateGoogleToOpenAIStream(
                         message.data,
                         model,
@@ -4769,6 +5032,7 @@ class RequestHandler {
         let modelStreamingMode = null;
         let modelForceCodeExecution = false;
         let modelForceWebSearch = false;
+        let cleanModelName = null;
 
         if (modelPathMatch) {
             const pathPrefix = modelPathMatch[1];
@@ -4782,12 +5046,12 @@ class RequestHandler {
             } = FormatConverter.parseModelBuiltInToolSuffixes(rawModelName);
             const { cleanModelName: streamStrippedModel, streamingMode: parsedStreamingMode } =
                 FormatConverter.parseModelStreamingModeSuffix(toolStrippedModel);
-            const { cleanModelName, thinkingLevel: parsedThinkingLevel } =
-                FormatConverter.parseModelThinkingLevel(streamStrippedModel);
+            const parsedModel = FormatConverter.parseModelThinkingLevel(streamStrippedModel);
+            cleanModelName = parsedModel.cleanModelName;
             modelForceCodeExecution = parsedForceCodeExecution;
             modelForceWebSearch = parsedForceWebSearch;
             modelStreamingMode = parsedStreamingMode;
-            modelThinkingLevel = parsedThinkingLevel;
+            modelThinkingLevel = parsedModel.thinkingLevel;
 
             const modelForceToolFlags = [];
             if (modelForceWebSearch) modelForceToolFlags.push("forceWebSearch=true");
@@ -4841,7 +5105,8 @@ class RequestHandler {
             if (!bodyObj.generationConfig.thinkingConfig) {
                 bodyObj.generationConfig.thinkingConfig = {};
             }
-            // Model name suffix thinkingLevel has highest priority, direct override
+            // A thinking-level suffix also opts in to returned thought parts.
+            bodyObj.generationConfig.thinkingConfig.includeThoughts = true;
             bodyObj.generationConfig.thinkingConfig.thinkingLevel = modelThinkingLevel;
             this.logger.info(
                 `[Proxy] Applied thinkingLevel from model name suffix: ${modelThinkingLevel} (Google Native)`
@@ -4853,6 +5118,13 @@ class RequestHandler {
         // 2. Sanitize tools (remove unsupported fields, convert type to uppercase)
         if (req.method === "POST" && bodyObj) {
             if (bodyObj.contents) {
+                const removedTrailingTurns = FormatConverter.removeUnsupportedTrailingModelTurns(bodyObj.contents);
+                if (removedTrailingTurns > 0) {
+                    this.logger.warn(
+                        `[Proxy] ${cleanModelName || "Gemini model"} does not support prefilling; ` +
+                            `removed ${removedTrailingTurns} trailing model turn(s).`
+                    );
+                }
                 this.formatConverter.ensureThoughtSignature(bodyObj);
             }
             if (bodyObj.tools) {

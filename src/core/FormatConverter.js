@@ -175,16 +175,11 @@ class FormatConverter {
      * /v1beta/models even though direct requests still work.
      *
      * The generated order is intentionally kept compatible with the former
-     * implementation:
+     * implementation while also exposing explicit real-stream variants:
      *   base
-     *   -search
-     *   -<thinking>
-     *   -<thinking>-fake
-     *   -<thinking>-search
-     *   -<thinking>-fake-search
-     *
-     * `-code` is included for the same conversational models because the
-     * current parser supports the code-execution directive as well.
+     *   -real / -fake
+     *   -search / -code / -search-code
+     *   -<thinking> plus the same streaming/tool combinations
      *
      * @param {Array<object>} models - Base model metadata entries
      * @returns {Array<object>} Base entries plus discoverable suffix variants
@@ -214,25 +209,50 @@ class FormatConverter {
 
             if (!isConversationalGemini) continue;
 
+            addModel(model, "-real");
+            addModel(model, "-fake");
             addModel(model, "-search");
             addModel(model, "-code");
             addModel(model, "-search-code");
+            addModel(model, "-real-search");
+            addModel(model, "-fake-search");
+            addModel(model, "-real-code");
+            addModel(model, "-fake-code");
+            addModel(model, "-real-search-code");
+            addModel(model, "-fake-search-code");
 
             if (model.thinking !== true) continue;
 
             for (const level of thinkingLevels) {
                 addModel(model, `-${level}`);
+                addModel(model, `-${level}-real`);
                 addModel(model, `-${level}-fake`);
                 addModel(model, `-${level}-search`);
+                addModel(model, `-${level}-real-search`);
                 addModel(model, `-${level}-fake-search`);
                 addModel(model, `-${level}-code`);
+                addModel(model, `-${level}-real-code`);
                 addModel(model, `-${level}-fake-code`);
                 addModel(model, `-${level}-search-code`);
+                addModel(model, `-${level}-real-search-code`);
                 addModel(model, `-${level}-fake-search-code`);
             }
         }
 
         return expanded;
+    }
+
+    static removeUnsupportedTrailingModelTurns(contents) {
+        if (!Array.isArray(contents)) {
+            return 0;
+        }
+
+        let removedCount = 0;
+        while (contents.length > 0 && contents.at(-1)?.role === "model") {
+            contents.pop();
+            removedCount++;
+        }
+        return removedCount;
     }
 
     constructor(logger, serverSystem) {
@@ -946,11 +966,9 @@ class FormatConverter {
             thinkingConfig = { ...(thinkingConfig || {}), includeThoughts: true };
         }
 
-        // If model name suffix specifies thinkingLevel, override directly (highest priority)
+        // A thinking-level suffix also opts in to returned thought parts.
         if (modelThinkingLevel) {
-            if (!thinkingConfig) {
-                thinkingConfig = {};
-            }
+            thinkingConfig = { ...(thinkingConfig || {}), includeThoughts: true };
             thinkingConfig.thinkingLevel = modelThinkingLevel;
             this.logger.info(`[Adapter] Applied thinkingLevel from model name suffix: ${modelThinkingLevel}`);
         }
@@ -1069,6 +1087,13 @@ class FormatConverter {
             } else {
                 this.logger.warn(`[Adapter] Unsupported response_format type: ${responseFormat.type}. Ignoring.`);
             }
+        }
+
+        const removedTrailingTurns = FormatConverter.removeUnsupportedTrailingModelTurns(googleRequest.contents);
+        if (removedTrailingTurns > 0) {
+            this.logger.warn(
+                `[Adapter] ${cleanModelName} does not support prefilling; removed ${removedTrailingTurns} trailing model turn(s).`
+            );
         }
 
         this._finalizeGoogleRequest(googleRequest, {
@@ -2539,9 +2564,9 @@ class FormatConverter {
             thinkingConfig = { ...(thinkingConfig || {}), includeThoughts: true };
         }
 
-        // Apply model name suffix thinkingLevel
+        // Apply model name suffix thinkingLevel and request returned thought parts.
         if (modelThinkingLevel) {
-            if (!thinkingConfig) thinkingConfig = {};
+            thinkingConfig = { ...(thinkingConfig || {}), includeThoughts: true };
             thinkingConfig.thinkingLevel = modelThinkingLevel;
         }
 
@@ -2722,6 +2747,13 @@ class FormatConverter {
         if (claudeBody.tool_choice && claudeBody.tool_choice.disable_parallel_tool_use === true) {
             this.logger.info(
                 "[Adapter] Claude request specifies disable_parallel_tool_use=true (Note: Applied as best-effort in Gemini)."
+            );
+        }
+
+        const removedTrailingTurns = FormatConverter.removeUnsupportedTrailingModelTurns(googleRequest.contents);
+        if (removedTrailingTurns > 0) {
+            this.logger.warn(
+                `[Adapter] ${cleanModelName} does not support prefilling; removed ${removedTrailingTurns} trailing model turn(s).`
             );
         }
 
@@ -3391,11 +3423,9 @@ class FormatConverter {
             thinkingConfig = { ...(thinkingConfig || {}), includeThoughts: true };
         }
 
-        // If model name suffix specifies thinkingLevel, override directly (highest priority)
+        // A thinking-level suffix also opts in to returned thought parts.
         if (modelThinkingLevel) {
-            if (!thinkingConfig) {
-                thinkingConfig = {};
-            }
+            thinkingConfig = { ...(thinkingConfig || {}), includeThoughts: true };
             thinkingConfig.thinkingLevel = modelThinkingLevel;
             this.logger.info(`[Adapter] Applied thinkingLevel from model name suffix: ${modelThinkingLevel}`);
         }
@@ -3623,6 +3653,13 @@ class FormatConverter {
                     "[Adapter] Set responseMimeType to application/json for OpenAI Response API json_object format"
                 );
             }
+        }
+
+        const removedTrailingTurns = FormatConverter.removeUnsupportedTrailingModelTurns(googleRequest.contents);
+        if (removedTrailingTurns > 0) {
+            this.logger.warn(
+                `[Adapter] ${cleanModelName} does not support prefilling; removed ${removedTrailingTurns} trailing model turn(s).`
+            );
         }
 
         this._finalizeGoogleRequest(googleRequest, {

@@ -36,6 +36,8 @@ const makeHandler = () => {
     handler.requestRouteCursor = 0;
     handler.requestFailureCounts = new Map();
     handler.accountRouteState = new Map();
+    handler.pendingUsageRotations = new Set();
+    handler.usageRotationPromise = null;
     handler.config = {
         accountCooldownMaxMs: 30000,
         accountCooldownMs: 1000,
@@ -165,6 +167,53 @@ const testReadyCheckMovesQueuedRequestOffCooldownAccount = async () => {
     assert.strictEqual(handler._getRequestAuthIndex("request-5"), 1);
 };
 
+const testPerAccountUsageRotation = async () => {
+    const { handler, connections } = makeHandler();
+    handler.config.maxContexts = 5;
+    handler.config.switchOnUses = 2;
+    handler.authSource = {
+        availableIndices: [0, 1, 2, 3, 4, 5],
+        getRotationIndices: () => [0, 1, 2, 3, 4, 5],
+        isExpired: () => false,
+    };
+    handler.browserManager = {
+        async closeContext(authIndex) {
+            this.contexts.delete(authIndex);
+            connections.delete(authIndex);
+        },
+        contexts: new Map([
+            [0, {}],
+            [1, {}],
+            [2, {}],
+            [3, {}],
+            [4, {}],
+        ]),
+        async ensureContextForAuth(authIndex) {
+            this.contexts.set(authIndex, {});
+            connections.set(authIndex, {
+                readyState: 1,
+                send() {},
+            });
+            return true;
+        },
+    };
+
+    handler._bindRequestAuthIndex("pool-request", 0);
+    handler._incrementGenerationUsage("pool-request", 0, "test generation");
+    const beforeThreshold = handler.getAccountRouteStatus(0);
+    assert.strictEqual(beforeThreshold.usageCount, 1);
+    assert.strictEqual(beforeThreshold.usageExhausted, false);
+
+    handler._incrementGenerationUsage("pool-request", 0, "test generation");
+    assert.strictEqual(handler.getAccountRouteStatus(0).usageExhausted, true);
+    handler._releaseRequestAuthIndex("pool-request");
+    await handler.usageRotationPromise;
+
+    assert.strictEqual(handler.browserManager.contexts.has(0), false);
+    assert.strictEqual(handler.browserManager.contexts.has(5), true);
+    assert.strictEqual(handler._selectRequestAuthIndex([], null), 1);
+};
+
 (async () => {
     testRoundRobinAndBinding();
     await testFailureDoesNotGloballySwitch();
@@ -175,6 +224,7 @@ const testReadyCheckMovesQueuedRequestOffCooldownAccount = async () => {
     testForwardUsesSelectedAccount();
     await testAccountTestPreservesActiveCooldown();
     await testReadyCheckMovesQueuedRequestOffCooldownAccount();
+    await testPerAccountUsageRotation();
     console.log("request routing tests: PASS");
 })().catch(error => {
     console.error(error.stack || error.message);
