@@ -1,8 +1,14 @@
-# Google AI Studio Build App to API Adapter
+# AIStudioToAPI Custom
 
 中文文档 | [English](README_EN.md)
 
-一个将 Google AI Studio Build App 网页端封装为兼容 OpenAI API、Gemini API 和 Anthropic API 的工具。该服务将充当代理，将 API 请求转换为与 AI Studio Build App 应用界面的浏览器交互。
+> **项目来源与许可证**
+>
+> 本项目 `mulan777/AIStudioToAPI-custom` 基于 [iBUHub/AIStudioToAPI](https://github.com/iBUHub/AIStudioToAPI) 进行二次开发；`iBUHub/AIStudioToAPI` 的上游项目为 [Ellinav/ais2api](https://github.com/Ellinav/ais2api)。感谢上游作者和贡献者。
+>
+> 本项目及其中来自上游的代码沿用 **CC BY-NC 4.0** 许可证。允许在遵守许可证条款的前提下进行非商业性的复制、修改和分发；发布二开版本时请保留原作者署名、上游项目链接和许可证声明，并明确标注修改内容。不得暗示上游作者对本项目提供官方认可或背书。商业用途请先取得相应权利人的许可，完整条款请参见 [`LICENSE`](LICENSE)。
+
+这是一个由 `mulan777` 维护的二开版本，将 Google AI Studio Build App 网页端封装为兼容 OpenAI API、Gemini API 和 Anthropic API 的工具。
 
 ## ✨ 功能特性
 
@@ -20,8 +26,8 @@
 1. 克隆仓库：
 
    ```bash
-   git clone https://github.com/iBUHub/AIStudioToAPI.git
-   cd AIStudioToAPI
+   git clone https://github.com/mulan777/AIStudioToAPI-custom.git
+   cd AIStudioToAPI-custom
    ```
 
 2. 运行快速设置脚本：

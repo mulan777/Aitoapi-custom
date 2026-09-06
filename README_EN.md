@@ -1,8 +1,14 @@
-# Google AI Studio Build App to API Adapter
+# AIStudioToAPI Custom
 
 [中文文档](README.md) | English
 
-A tool that wraps the Google AI Studio Build App web interface to provide OpenAI API, Gemini API, and Anthropic API compatible endpoints. The service acts as a proxy, converting API requests into browser interactions with the AI Studio Build App interface.
+> **Project lineage and license**
+>
+> `mulan777/AIStudioToAPI-custom` is a modified version based on [iBUHub/AIStudioToAPI](https://github.com/iBUHub/AIStudioToAPI), whose upstream project is [Ellinav/ais2api](https://github.com/Ellinav/ais2api). Thanks to the upstream authors and contributors.
+>
+> This project and the upstream-derived code use the **CC BY-NC 4.0** license. Non-commercial copying, modification, and distribution are permitted only when the license terms are followed. Redistributed derivatives must retain the original attribution, upstream links, and license notice, and must clearly identify modifications. This project is not an official upstream release and does not imply upstream endorsement. Obtain additional permission from the relevant rights holders before any commercial use. See [`LICENSE`](LICENSE) for the complete terms.
+
+This is a `mulan777`-maintained fork that wraps the Google AI Studio Build App web interface with OpenAI API, Gemini API, and Anthropic API compatible endpoints.
 
 ## ✨ Features
 
@@ -20,8 +26,8 @@ A tool that wraps the Google AI Studio Build App web interface to provide OpenAI
 1. Clone the repository:
 
    ```bash
-   git clone https://github.com/iBUHub/AIStudioToAPI.git
-   cd AIStudioToAPI
+   git clone https://github.com/mulan777/AIStudioToAPI-custom.git
+   cd AIStudioToAPI-custom
    ```
 
 2. Run the setup script:
