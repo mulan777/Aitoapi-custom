@@ -87,10 +87,10 @@ docker run -d \
   -e API_KEYS=your-api-key-1,your-api-key-2 \
   -e TZ=Asia/Shanghai \
   --restart unless-stopped \
-  ghcr.io/ibuhub/aistudio-to-api:latest
+  ghcr.io/mulan777/aistudio-to-api-custom:latest
 ```
 
-> 💡 **提示：** 如果 `ghcr.io` 访问速度较慢或不可用，可以使用 Docker Hub 镜像：`ibuhub/aistudio-to-api:latest`。
+> **提示：** 当前官方镜像发布地址为 GHCR：`ghcr.io/mulan777/aistudio-to-api-custom:latest`。
 
 参数说明：
 
@@ -109,7 +109,7 @@ name: aistudio-to-api
 
 services:
   app:
-    image: ghcr.io/ibuhub/aistudio-to-api:latest
+    image: ghcr.io/mulan777/aistudio-to-api-custom:latest
     container_name: aistudio-to-api
     ports:
       # API 服务器端口（如果使用反向代理，强烈建议改成 127.0.0.1:7860）
@@ -127,7 +127,7 @@ services:
       TZ: Asia/Shanghai
 ```
 
-> 💡 **提示：** 如果 `ghcr.io` 访问速度较慢或不可用，可以将 `image` 改为 `ibuhub/aistudio-to-api:latest`。
+> 💡 **提示：** 如果 `ghcr.io` 访问速度较慢或不可用，可以将 `image` 改为 `ghcr.io/mulan777/aistudio-to-api-custom:latest`。
 
 ##### 🛠️ 方式 3：从源码构建
 

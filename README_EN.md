@@ -87,10 +87,10 @@ docker run -d \
   -e API_KEYS=your-api-key-1,your-api-key-2 \
   -e TZ=America/New_York \
   --restart unless-stopped \
-  ghcr.io/ibuhub/aistudio-to-api:latest
+  ghcr.io/mulan777/aistudio-to-api-custom:latest
 ```
 
-> 💡 **Tip:** If `ghcr.io` is slow or unavailable, you can use the Docker Hub image: `ibuhub/aistudio-to-api:latest`.
+> **Tip:** The official image is published to GHCR: `ghcr.io/mulan777/aistudio-to-api-custom:latest`.
 
 Parameters:
 
@@ -109,7 +109,7 @@ name: aistudio-to-api
 
 services:
   app:
-    image: ghcr.io/ibuhub/aistudio-to-api:latest
+    image: ghcr.io/mulan777/aistudio-to-api-custom:latest
     container_name: aistudio-to-api
     ports:
       # API server port (if using a reverse proxy, strongly consider `127.0.0.1:7860`)
