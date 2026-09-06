@@ -1,10 +1,10 @@
-# AIStudioToAPI Custom
+# Aitoapi Custom
 
 这是由 `mulan777` 维护的二开项目。
 
 ## 项目来源与许可证
 
-本项目 `mulan777/AIStudioToAPI-custom` 基于 [iBUHub/AIStudioToAPI](https://github.com/iBUHub/AIStudioToAPI) 和 [Ellinav/ais2api](https://github.com/Ellinav/ais2api) 进行二次开发；感谢两位上游作者和贡献者。本项目及其中来自上游的代码沿用 **CC BY-NC 4.0** 许可证。非商业复制、修改和分发必须保留原作者署名、上游链接和许可证声明，并标注本项目的修改内容；不得暗示上游作者认可或背书。商业用途请先取得相应权利人的许可，完整条款见 [`LICENSE`](LICENSE)。
+本项目 `mulan777/Aitoapi-custom` 基于 [iBUHub/AIStudioToAPI](https://github.com/iBUHub/AIStudioToAPI) 和 [Ellinav/ais2api](https://github.com/Ellinav/ais2api) 进行二次开发；感谢两位上游作者和贡献者。本项目及其中来自上游的代码沿用 **CC BY-NC 4.0** 许可证。非商业复制、修改和分发必须保留原作者署名、上游链接和许可证声明，并标注本项目的修改内容；不得暗示上游作者认可或背书。商业用途请先取得相应权利人的许可，完整条款见 [`LICENSE`](LICENSE)。
 
 ## 二开内容
 

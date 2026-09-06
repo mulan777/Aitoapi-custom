@@ -1,6 +1,6 @@
 # 部署到 Zeabur
 
-本指南将帮助你在 [Zeabur](https://zeabur.com/) 上部署 `aistudio-to-api` 服务。
+本指南将帮助你在 [Zeabur](https://zeabur.com/) 上部署 `aitoapi-custom` 服务。
 
 > [!IMPORTANT]
 > **说明：自 2026/03/15 起，Zeabur 已停止在共享集群上创建新项目，因此目前已无法按本教程免费新建共享集群项目。以下内容为旧版部署教程，仅供参考。**
@@ -18,7 +18,7 @@
 4. **配置应用**：填写以下参数：
 
    **镜像**：
-   - **镜像名称**：`ghcr.io/ibuhub/aistudio-to-api:latest`
+   - **镜像名称**：`ghcr.io/mulan777/aitoapi-custom:latest`
    - **用户名**：不用填写
    - **密码**：不用填写
 

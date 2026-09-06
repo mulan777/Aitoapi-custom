@@ -1,6 +1,6 @@
 # Deploy on Claw Cloud Run
 
-This guide will help you deploy the `aistudio-to-api` service on [Claw Cloud Run](https://claw.cloud/).
+This guide will help you deploy the `aitoapi-custom` service on [Claw Cloud Run](https://claw.cloud/).
 
 > [!IMPORTANT]
 > **Notice: Since May 11, 2026, 00:00 UTC, Claw Cloud Run has discontinued its product and related services, so this setup path is no longer available for new or running services. The instructions below are kept as a legacy reference.**
@@ -14,7 +14,7 @@ This guide will help you deploy the `aistudio-to-api` service on [Claw Cloud Run
 3. **Configure Application**: Fill in the following parameters:
    - **Application Name**: Enter any name you prefer (e.g., `aistudio-api`).
    - **Image**: Select **Public**.
-   - **Image Name**: `ghcr.io/ibuhub/aistudio-to-api:latest`
+   - **Image Name**: `ghcr.io/mulan777/aitoapi-custom:latest`
 
    **Usage**:
    - **CPU**: `0.5`

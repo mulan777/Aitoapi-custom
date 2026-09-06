@@ -1,6 +1,6 @@
 # 部署到 Claw Cloud Run
 
-本指南将帮助你在 [Claw Cloud Run](https://claw.cloud/) 上部署 `aistudio-to-api` 服务。
+本指南将帮助你在 [Claw Cloud Run](https://claw.cloud/) 上部署 `aitoapi-custom` 服务。
 
 > [!IMPORTANT]
 > **说明：自 2026/05/11 00:00 UTC 起，Claw Cloud Run 已停止产品及相关服务，因此目前已无法按本教程新建或继续运行服务。以下内容为旧版部署教程，仅供参考。**
@@ -14,7 +14,7 @@
 3. **配置应用**：填写以下参数：
    - **Application Name**：填写一个你喜欢的英文名称（例如 `aistudio-api`）。
    - **Image**：选择 **Public**。
-   - **Image Name**：`ghcr.io/ibuhub/aistudio-to-api:latest`
+   - **Image Name**：`ghcr.io/mulan777/aitoapi-custom:latest`
 
    **Usage**:
    - **CPU**：`0.5`

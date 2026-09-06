@@ -92,8 +92,8 @@ const t = (key, options) => {
 const isZh = computed(() => currentLang.value === "zh");
 const baseUrl = computed(() =>
     isZh.value
-        ? "https://github.com/iBUHub/AIStudioToAPI"
-        : "https://github.com/iBUHub/AIStudioToAPI/blob/main/README_EN.md"
+        ? "https://github.com/mulan777/Aitoapi-custom"
+        : "https://github.com/mulan777/Aitoapi-custom/blob/main/README_EN.md"
 );
 
 const docUrl = computed(() => {

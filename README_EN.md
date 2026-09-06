@@ -1,10 +1,10 @@
-# AIStudioToAPI Custom
+# Aitoapi Custom
 
 [中文文档](README.md) | English
 
 > **Project lineage and license**
 >
-> `mulan777/AIStudioToAPI-custom` is developed based on [iBUHub/AIStudioToAPI](https://github.com/iBUHub/AIStudioToAPI) and [Ellinav/ais2api](https://github.com/Ellinav/ais2api). Thanks to both upstream authors and their contributors.
+> `mulan777/Aitoapi-custom` is developed based on [iBUHub/AIStudioToAPI](https://github.com/iBUHub/AIStudioToAPI) and [Ellinav/ais2api](https://github.com/Ellinav/ais2api). Thanks to both upstream authors and their contributors.
 >
 > This project and the upstream-derived code use the **CC BY-NC 4.0** license. Non-commercial copying, modification, and distribution are permitted only when the license terms are followed. Redistributed derivatives must retain the original attribution, upstream links, and license notice, and must clearly identify modifications. This project is not an official upstream release and does not imply upstream endorsement. Obtain additional permission from the relevant rights holders before any commercial use. See [`LICENSE`](LICENSE) for the complete terms.
 
@@ -26,8 +26,8 @@ This is a `mulan777`-maintained fork that wraps the Google AI Studio Build App w
 1. Clone the repository:
 
    ```bash
-   git clone https://github.com/mulan777/AIStudioToAPI-custom.git
-   cd AIStudioToAPI-custom
+   git clone https://github.com/mulan777/Aitoapi-custom.git
+   cd Aitoapi-custom
    ```
 
 2. Run the setup script:
@@ -86,17 +86,17 @@ Deploy using Docker without pre-extracting authentication credentials.
 
 ```bash
 docker run -d \
-  --name aistudio-to-api \
+  --name aitoapi-custom \
   -p 7860:7860 \
   -v /path/to/auth:/app/configs/auth \
   -v /path/to/data:/app/data \
   -e API_KEYS=your-api-key-1,your-api-key-2 \
   -e TZ=America/New_York \
   --restart unless-stopped \
-  ghcr.io/mulan777/aistudio-to-api-custom:latest
+  ghcr.io/mulan777/aitoapi-custom:latest
 ```
 
-> **Tip:** The official image is published to GHCR: `ghcr.io/mulan777/aistudio-to-api-custom:latest`.
+> **Tip:** The official image is published to GHCR: `ghcr.io/mulan777/aitoapi-custom:latest`.
 
 Parameters:
 
@@ -111,12 +111,12 @@ Parameters:
 Create a `docker-compose.yml` file:
 
 ```yaml
-name: aistudio-to-api
+name: aitoapi-custom
 
 services:
   app:
-    image: ghcr.io/mulan777/aistudio-to-api-custom:latest
-    container_name: aistudio-to-api
+    image: ghcr.io/mulan777/aitoapi-custom:latest
+    container_name: aitoapi-custom
     ports:
       # API server port (if using a reverse proxy, strongly consider `127.0.0.1:7860`)
       - 7860:7860
@@ -140,21 +140,21 @@ If you prefer to build the Docker image yourself, you can use the following comm
 1. Build the image:
 
    ```bash
-   docker build -t aistudio-to-api .
+   docker build -t aitoapi-custom .
    ```
 
 2. Run the container:
 
    ```bash
    docker run -d \
-     --name aistudio-to-api \
+     --name aitoapi-custom \
      -p 7860:7860 \
      -v /path/to/auth:/app/configs/auth \
      -v /path/to/data:/app/data \
      -e API_KEYS=your-api-key-1,your-api-key-2 \
      -e TZ=America/New_York \
      --restart unless-stopped \
-     aistudio-to-api
+     aitoapi-custom
    ```
 
 #### 🔑 Step 2: Account Management
@@ -232,15 +232,15 @@ This endpoint forwards requests to the Gemini API format endpoint.
 
 ## 🖥️ Recommended Frontend: AMC WebUI
 
-[AMC WebUI](https://github.com/yeahhe365/AMC-WebUI) is a Local-First Gemini workflow WebUI with multimodal chat, Canvas, file processing, realtime search, code execution, and advanced reasoning. It already supports AIStudioToAPI as a third-party Gemini-compatible backend and can be used as a graphical frontend for this project.
+[AMC WebUI](https://github.com/yeahhe365/AMC-WebUI) is a Local-First Gemini workflow WebUI with multimodal chat, Canvas, file processing, realtime search, code execution, and advanced reasoning. It already supports Aitoapi Custom as a third-party Gemini-compatible backend and can be used as a graphical frontend for this project.
 
 Online demo: [https://all-model-chat.pages.dev](https://all-model-chat.pages.dev)
 
 Usage:
 
-- Deploy and start AIStudioToAPI first, and make sure the Gemini native API endpoint is reachable, for example `http://localhost:7860/v1beta`.
-- In AMC WebUI, go to **Settings -> API Configuration**, enable "Custom API Configuration", and set the Gemini-compatible Base URL to AIStudioToAPI's `/v1beta` endpoint.
-- The API Key configured in AMC WebUI should match one of the `API_KEYS` configured for AIStudioToAPI.
+- Deploy and start Aitoapi Custom first, and make sure the Gemini native API endpoint is reachable, for example `http://localhost:7860/v1beta`.
+- In AMC WebUI, go to **Settings -> API Configuration**, enable "Custom API Configuration", and set the Gemini-compatible Base URL to Aitoapi Custom's `/v1beta` endpoint.
+- The API Key configured in AMC WebUI should match one of the `API_KEYS` configured for Aitoapi Custom.
 
 ## 🧰 Configuration
 
@@ -360,6 +360,6 @@ We would like to thank all developers who have contributed their time, effort, a
 
 ---
 
-If you find AIStudioToAPI useful, consider giving it a ⭐️!
+If you find Aitoapi Custom useful, consider giving it a ⭐️!
 
 [![Star History Chart](https://api.star-history.com/svg?repos=iBUHub/AIStudioToAPI&type=date&legend=top-left)](https://www.star-history.com/#iBUHub/AIStudioToAPI&type=date&legend=top-left)

@@ -1,6 +1,6 @@
 # Deploy on Zeabur
 
-This guide will help you deploy the `aistudio-to-api` service on [Zeabur](https://zeabur.com/).
+This guide will help you deploy the `aitoapi-custom` service on [Zeabur](https://zeabur.com/).
 
 > [!IMPORTANT]
 > **Notice: Since March 15, 2026, Zeabur no longer allows new projects to be created on the Shared Cluster, so this free setup path is no longer available for new deployments. The instructions below are kept as a legacy reference.**
@@ -18,7 +18,7 @@ This guide will help you deploy the `aistudio-to-api` service on [Zeabur](https:
 4. **Configure Application**: Fill in the following parameters:
 
    **Image**:
-   - **Image Name**: `ghcr.io/ibuhub/aistudio-to-api:latest`
+   - **Image Name**: `ghcr.io/mulan777/aitoapi-custom:latest`
    - **Username**: Leave empty
    - **Password**: Leave empty
 

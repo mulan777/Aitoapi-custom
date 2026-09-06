@@ -1091,7 +1091,7 @@
                                     >
                                         <a
                                             :href="
-                                                state.releaseUrl || 'https://github.com/iBUHub/AIStudioToAPI/releases'
+                                                state.releaseUrl || 'https://github.com/mulan777/Aitoapi-custom/releases'
                                             "
                                             target="_blank"
                                             class="update-link"
@@ -1101,7 +1101,7 @@
                                         <a
                                             class="copy-icon"
                                             :href="
-                                                state.releaseUrl || 'https://github.com/iBUHub/AIStudioToAPI/releases'
+                                                state.releaseUrl || 'https://github.com/mulan777/Aitoapi-custom/releases'
                                             "
                                             target="_blank"
                                             style="color: inherit; display: inline-flex"
@@ -1127,7 +1127,7 @@
                                     </span>
                                     <span v-else class="clickable-version" :title="t('viewRelease')">
                                         <a
-                                            href="https://github.com/iBUHub/AIStudioToAPI/releases"
+                                            href="https://github.com/mulan777/Aitoapi-custom/releases"
                                             target="_blank"
                                             style="color: inherit; text-decoration: none"
                                         >
@@ -1135,7 +1135,7 @@
                                         </a>
                                         <a
                                             class="copy-icon"
-                                            href="https://github.com/iBUHub/AIStudioToAPI/releases"
+                                            href="https://github.com/mulan777/Aitoapi-custom/releases"
                                             target="_blank"
                                             style="color: inherit; display: inline-flex"
                                         >
@@ -5083,7 +5083,7 @@ const downloadUsageStats = async () => {
             return;
         }
 
-        const filename = `AIStudioToAPI_usage-stats_${formatDownloadTimestamp()}.jsonl`;
+        const filename = `Aitoapi Custom_usage-stats_${formatDownloadTimestamp()}.jsonl`;
         const a = document.createElement("a");
         a.href = "/api/usage-stats/download";
         a.download = filename;
@@ -5102,7 +5102,7 @@ const downloadCurrentLogs = () => {
     if (!state.logs) return;
 
     const blob = new Blob([state.logs], { type: "text/plain" });
-    const filename = `AIStudioToAPI_${formatDownloadTimestamp()}_${state.logCount}.log`;
+    const filename = `Aitoapi Custom_${formatDownloadTimestamp()}_${state.logCount}.log`;
 
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");

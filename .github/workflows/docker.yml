@@ -12,7 +12,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: mulan777/aistudio-to-api-custom
+  IMAGE_NAME: mulan777/aitoapi-custom
   VERSION: ${{ github.ref_name }}
 
 jobs:

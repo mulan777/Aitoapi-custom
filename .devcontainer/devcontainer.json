@@ -1,5 +1,5 @@
 {
-    "name": "AIStudioToAPI Dev Container",
+    "name": "Aitoapi Custom Dev Container",
     "dockerComposeFile": "docker-compose.yml",
     "service": "app",
     "workspaceFolder": "/workspace",

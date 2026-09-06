@@ -14,8 +14,8 @@ const axios = require("axios");
 class VersionChecker {
     constructor(logger) {
         this.logger = logger;
-        this.repoOwner = "iBUHub";
-        this.repoName = "AIStudioToAPI";
+        this.repoOwner = "mulan777";
+        this.repoName = "Aitoapi-custom";
     }
 
     /**
@@ -66,7 +66,7 @@ class VersionChecker {
      * @returns {Promise<boolean>}
      */
     async checkDockerImageExists(tag) {
-        const image = "ibuhub/aistudio-to-api";
+        const image = "mulan777/aitoapi-custom";
         const registry = "ghcr.io";
         const manifestUrl = `https://${registry}/v2/${image}/manifests/${tag}`;
 
@@ -129,7 +129,7 @@ class VersionChecker {
             const response = await axios.get(`https://api.github.com/repos/${this.repoOwner}/${this.repoName}/tags`, {
                 headers: {
                     Accept: "application/vnd.github.v3+json",
-                    "User-Agent": "AIStudioToAPI-VersionChecker",
+                    "User-Agent": "Aitoapi Custom-VersionChecker",
                 },
                 timeout: 10000,
             });

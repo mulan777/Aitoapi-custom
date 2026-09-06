@@ -1,10 +1,10 @@
-# AIStudioToAPI Custom
+# Aitoapi Custom
 
 中文文档 | [English](README_EN.md)
 
 > **项目来源与许可证**
 >
-> 本项目 `mulan777/AIStudioToAPI-custom` 基于 [iBUHub/AIStudioToAPI](https://github.com/iBUHub/AIStudioToAPI) 和 [Ellinav/ais2api](https://github.com/Ellinav/ais2api) 进行二次开发；感谢两位上游作者和贡献者。
+> 本项目 `mulan777/Aitoapi-custom` 基于 [iBUHub/AIStudioToAPI](https://github.com/iBUHub/AIStudioToAPI) 和 [Ellinav/ais2api](https://github.com/Ellinav/ais2api) 进行二次开发；感谢两位上游作者和贡献者。
 >
 > 本项目及其中来自上游的代码沿用 **CC BY-NC 4.0** 许可证。允许在遵守许可证条款的前提下进行非商业性的复制、修改和分发；发布二开版本时请保留原作者署名、上游项目链接和许可证声明，并明确标注修改内容。不得暗示上游作者对本项目提供官方认可或背书。商业用途请先取得相应权利人的许可，完整条款请参见 [`LICENSE`](LICENSE)。
 
@@ -26,8 +26,8 @@
 1. 克隆仓库：
 
    ```bash
-   git clone https://github.com/mulan777/AIStudioToAPI-custom.git
-   cd AIStudioToAPI-custom
+   git clone https://github.com/mulan777/Aitoapi-custom.git
+   cd Aitoapi-custom
    ```
 
 2. 运行快速设置脚本：
@@ -86,17 +86,17 @@
 
 ```bash
 docker run -d \
-  --name aistudio-to-api \
+  --name aitoapi-custom \
   -p 7860:7860 \
   -v /path/to/auth:/app/configs/auth \
   -v /path/to/data:/app/data \
   -e API_KEYS=your-api-key-1,your-api-key-2 \
   -e TZ=Asia/Shanghai \
   --restart unless-stopped \
-  ghcr.io/mulan777/aistudio-to-api-custom:latest
+  ghcr.io/mulan777/aitoapi-custom:latest
 ```
 
-> **提示：** 当前官方镜像发布地址为 GHCR：`ghcr.io/mulan777/aistudio-to-api-custom:latest`。
+> **提示：** 当前官方镜像发布地址为 GHCR：`ghcr.io/mulan777/aitoapi-custom:latest`。
 
 参数说明：
 
@@ -111,12 +111,12 @@ docker run -d \
 创建 `docker-compose.yml` 文件：
 
 ```yaml
-name: aistudio-to-api
+name: aitoapi-custom
 
 services:
   app:
-    image: ghcr.io/mulan777/aistudio-to-api-custom:latest
-    container_name: aistudio-to-api
+    image: ghcr.io/mulan777/aitoapi-custom:latest
+    container_name: aitoapi-custom
     ports:
       # API 服务器端口（如果使用反向代理，强烈建议改成 127.0.0.1:7860）
       - 7860:7860
@@ -133,7 +133,7 @@ services:
       TZ: Asia/Shanghai
 ```
 
-> 💡 **提示：** 如果 `ghcr.io` 访问速度较慢或不可用，可以将 `image` 改为 `ghcr.io/mulan777/aistudio-to-api-custom:latest`。
+> 💡 **提示：** 如果 `ghcr.io` 访问速度较慢或不可用，可以将 `image` 改为 `ghcr.io/mulan777/aitoapi-custom:latest`。
 
 ##### 🛠️ 方式 3：从源码构建
 
@@ -142,21 +142,21 @@ services:
 1. 构建镜像：
 
    ```bash
-   docker build -t aistudio-to-api .
+   docker build -t aitoapi-custom .
    ```
 
 2. 运行容器：
 
    ```bash
    docker run -d \
-     --name aistudio-to-api \
+     --name aitoapi-custom \
      -p 7860:7860 \
      -v /path/to/auth:/app/configs/auth \
      -v /path/to/data:/app/data \
      -e API_KEYS=your-api-key-1,your-api-key-2 \
      -e TZ=Asia/Shanghai \
      --restart unless-stopped \
-     aistudio-to-api
+     aitoapi-custom
    ```
 
 #### 🔑 步骤 2：账号管理
@@ -234,15 +234,15 @@ services:
 
 ## 🖥️ 推荐前端：AMC WebUI
 
-[AMC WebUI](https://github.com/yeahhe365/AMC-WebUI) 是一款面向 Gemini 的 Local-First AI 工作流 WebUI，集成多模态聊天、Canvas、文件处理、实时搜索、代码执行与高级推理。它已经支持将 AIStudioToAPI 作为第三方 Gemini 兼容后端使用，可以作为本项目的图形化前端。
+[AMC WebUI](https://github.com/yeahhe365/AMC-WebUI) 是一款面向 Gemini 的 Local-First AI 工作流 WebUI，集成多模态聊天、Canvas、文件处理、实时搜索、代码执行与高级推理。它已经支持将 Aitoapi Custom 作为第三方 Gemini 兼容后端使用，可以作为本项目的图形化前端。
 
 在线 Demo：[https://all-model-chat.pages.dev](https://all-model-chat.pages.dev)
 
 使用方式：
 
-- 先部署并启动 AIStudioToAPI，确保 Gemini 原生 API 地址可访问，例如 `http://localhost:7860/v1beta`。
-- 在 AMC WebUI 中进入 **设置 -> API 配置**，启用“自定义 API 配置”，并将 Gemini 兼容 Base URL 填为 AIStudioToAPI 的 `/v1beta` 地址。
-- AMC WebUI 中填写的 API Key 应与 AIStudioToAPI 部署时配置的 `API_KEYS` 对应。
+- 先部署并启动 Aitoapi Custom，确保 Gemini 原生 API 地址可访问，例如 `http://localhost:7860/v1beta`。
+- 在 AMC WebUI 中进入 **设置 -> API 配置**，启用“自定义 API 配置”，并将 Gemini 兼容 Base URL 填为 Aitoapi Custom 的 `/v1beta` 地址。
+- AMC WebUI 中填写的 API Key 应与 Aitoapi Custom 部署时配置的 `API_KEYS` 对应。
 
 ## 🧰 相关配置
 
@@ -352,7 +352,7 @@ NO_PROXY=internal.example.com,10.0.0.0/8
 
 ## 📄 许可证
 
-本项目基于 [iBUHub/AIStudioToAPI](https://github.com/iBUHub/AIStudioToAPI) 和 [Ellinav/ais2api](https://github.com/Ellinav/ais2api) 进行二次开发，由 `mulan777` 维护发布，并沿用 **CC BY-NC 4.0** 许可证。其使用、分发与修改行为均需遵守许可证全部条款，完整许可内容请参见 [`LICENSE`](LICENSE)。
+本项目 `mulan777/Aitoapi-custom` 基于 [iBUHub/AIStudioToAPI](https://github.com/iBUHub/AIStudioToAPI) 和 [Ellinav/ais2api](https://github.com/Ellinav/ais2api) 进行二次开发，由 `mulan777` 维护发布，并沿用 **CC BY-NC 4.0** 许可证。其使用、分发与修改行为均需遵守许可证全部条款，完整许可内容请参见 [`LICENSE`](LICENSE)。
 
 ## 🤝 贡献者
 
@@ -362,6 +362,6 @@ NO_PROXY=internal.example.com,10.0.0.0/8
 
 ---
 
-如果你觉得 AIStudioToAPI 对你有帮助，欢迎给项目点一个 ⭐️！
+如果你觉得 Aitoapi Custom 对你有帮助，欢迎给项目点一个 ⭐️！
 
 [![Star History Chart](https://api.star-history.com/svg?repos=iBUHub/AIStudioToAPI&type=date&legend=top-left)](https://www.star-history.com/#iBUHub/AIStudioToAPI&type=date&legend=top-left)
