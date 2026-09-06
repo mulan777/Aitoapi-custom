@@ -42,6 +42,7 @@ class RequestHandler {
         // not a safe request-routing key: another request can change it while an
         // existing stream is still waiting on its own WebSocket queue.
         this.requestAuthBindings = new Map();
+        this.requestModelBindings = new Map();
         this.requestRouteCursor = 0;
         this.requestFailureCounts = new Map();
         this.accountRouteState = new Map();
@@ -53,8 +54,59 @@ class RequestHandler {
         };
     }
 
-    _selectRequestAuthIndex(excluded = []) {
+    _normalizeRouteModel(modelName) {
+        if (!modelName) return null;
+        let value = String(modelName)
+            .trim()
+            .replace(/^models\//, "")
+            .replace(/^\/+/, "");
+        try {
+            value = FormatConverter.parseModelBuiltInToolSuffixes(value).cleanModelName;
+            value = FormatConverter.parseModelStreamingModeSuffix(value).cleanModelName;
+            value = FormatConverter.parseModelThinkingLevel(value).cleanModelName;
+        } catch {
+            // Keep the original normalized name if an optional model parser
+            // changes in a future converter version.
+        }
+        return value || null;
+    }
+
+    _getRequestedModel(req) {
+        if (!req) return null;
+        const pathMatch = String(req.path || "").match(/\/models\/([^:/?]+)(?::|$)/);
+        return this._normalizeRouteModel(pathMatch ? pathMatch[1] : req.body?.model || req.query?.model);
+    }
+
+    _getProxyRequestModel(proxyRequest) {
+        if (proxyRequest?.tracking_model) return this._normalizeRouteModel(proxyRequest.tracking_model);
+        const pathMatch = String(proxyRequest?.path || "").match(/\/models\/([^:/?]+)(?::|$)/);
+        return this._normalizeRouteModel(pathMatch ? pathMatch[1] : null);
+    }
+
+    async _warmStandbyForModel(modelName, excluded = []) {
+        const routeModel = this._normalizeRouteModel(modelName);
+        if (!routeModel || !this.browserManager?.ensureContextForAuth) return false;
+        const excludedSet = new Set(excluded);
+        const candidates = (this.authSource?.getRotationIndices?.() || this.authSource?.availableIndices || [])
+            .filter(index => !excludedSet.has(index) && !this.browserManager.contexts.has(index))
+            .filter(index => !this.authSource?.isExpired?.(index));
+
+        for (const authIndex of candidates) {
+            const state = this._getAccountRouteState(authIndex);
+            if (state.cooldownUntil > Date.now() || (state.modelCooldowns?.[routeModel] || 0) > Date.now()) {
+                continue;
+            }
+            if (await this.browserManager.ensureContextForAuth(authIndex)) {
+                this.logger.info(`[Routing] Warmed standby account #${authIndex} for model "${routeModel}".`);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    _selectRequestAuthIndex(excluded = [], modelName = null) {
         const excludedSet = new Set(excluded.filter(index => Number.isInteger(index) && index >= 0));
+        const routeModel = this._normalizeRouteModel(modelName);
         const now = Date.now();
         const activeIndices = [...this.connectionRegistry.getAllConnections().entries()]
             .filter(([, connection]) => connection && connection.readyState === 1)
@@ -62,7 +114,8 @@ class RequestHandler {
             .filter(authIndex => {
                 if (excludedSet.has(authIndex)) return false;
                 const routeState = this.accountRouteState.get(authIndex);
-                return !routeState || !routeState.cooldownUntil || routeState.cooldownUntil <= now;
+                if (routeState?.cooldownUntil > now) return false;
+                return !routeModel || (routeState?.modelCooldowns?.[routeModel] || 0) <= now;
             })
             .sort((a, b) => a - b);
 
@@ -76,7 +129,8 @@ class RequestHandler {
                 !excludedSet.has(current) &&
                 currentConnection &&
                 currentConnection.readyState === 1 &&
-                (!currentState?.cooldownUntil || currentState.cooldownUntil <= now);
+                (!currentState?.cooldownUntil || currentState.cooldownUntil <= now) &&
+                (!routeModel || (currentState?.modelCooldowns?.[routeModel] || 0) <= now);
             return currentAvailable ? current : -1;
         }
 
@@ -92,7 +146,15 @@ class RequestHandler {
 
     _getAccountRouteState(authIndex) {
         if (!Number.isInteger(authIndex) || authIndex < 0) {
-            return { cooldownUntil: 0, inFlight: 0, lastError: null, lastStatus: null, rateLimitHits: 0 };
+            return {
+                cooldownUntil: 0,
+                inFlight: 0,
+                lastError: null,
+                lastStatus: null,
+                modelCooldowns: {},
+                modelRateLimitHits: {},
+                rateLimitHits: 0,
+            };
         }
         if (!this.accountRouteState.has(authIndex)) {
             this.accountRouteState.set(authIndex, {
@@ -100,6 +162,8 @@ class RequestHandler {
                 inFlight: 0,
                 lastError: null,
                 lastStatus: null,
+                modelCooldowns: {},
+                modelRateLimitHits: {},
                 rateLimitHits: 0,
             });
         }
@@ -113,28 +177,51 @@ class RequestHandler {
     }
 
     _markAccount429(authIndex, errorDetails) {
+        return this._markAccount429ForModel(authIndex, null, errorDetails);
+    }
+
+    _markAccount429ForModel(authIndex, modelName, errorDetails) {
         if (!Number.isInteger(authIndex) || authIndex < 0) return;
         const state = this._getAccountRouteState(authIndex);
         const base = Math.max(1000, this.config.accountCooldownMs || 300000);
         const max = Math.max(base, this.config.accountCooldownMaxMs || 1800000);
         const retryAfterMs = this._parseRetryAfterMs(errorDetails);
-        const backoffMs = Math.min(max, base * 2 ** Math.min(state.rateLimitHits, 3));
+        const routeModel = this._normalizeRouteModel(modelName);
+        const hitCount = routeModel ? state.modelRateLimitHits[routeModel] || 0 : state.rateLimitHits;
+        const backoffMs = Math.min(max, base * 2 ** Math.min(hitCount, 3));
         const cooldownMs = Math.min(max, Math.max(retryAfterMs, backoffMs));
-        state.cooldownUntil = Date.now() + cooldownMs;
+        const cooldownUntil = Date.now() + cooldownMs;
+        if (routeModel) {
+            state.modelCooldowns[routeModel] = Math.max(state.modelCooldowns[routeModel] || 0, cooldownUntil);
+        } else {
+            state.cooldownUntil = cooldownUntil;
+        }
         state.lastError = errorDetails?.message || "Upstream returned HTTP 429";
         state.lastStatus = 429;
-        state.rateLimitHits += 1;
+        if (routeModel) {
+            state.modelRateLimitHits[routeModel] = hitCount + 1;
+        } else {
+            state.rateLimitHits += 1;
+        }
         this.logger.warn(
-            `[Routing] Account #${authIndex} entered 429 cooldown for ${Math.ceil(cooldownMs / 1000)}s; new requests will skip it.`
+            `[Routing] Account #${authIndex} entered ${routeModel ? `model "${routeModel}" ` : ""}429 cooldown for ${Math.ceil(cooldownMs / 1000)}s; matching requests will skip it.`
         );
     }
 
-    _markAccountSuccess(authIndex) {
+    _markAccountSuccess(authIndex, modelName = null) {
         if (!Number.isInteger(authIndex) || authIndex < 0) return;
         const state = this._getAccountRouteState(authIndex);
         state.lastError = null;
         state.lastStatus = 200;
-        state.rateLimitHits = 0;
+        const routeModel = this._normalizeRouteModel(modelName);
+        if (routeModel) {
+            state.modelRateLimitHits[routeModel] = 0;
+            if (state.modelCooldowns[routeModel] <= Date.now()) {
+                delete state.modelCooldowns[routeModel];
+            }
+        } else {
+            state.rateLimitHits = 0;
+        }
         if (state.cooldownUntil && state.cooldownUntil <= Date.now()) state.cooldownUntil = 0;
     }
 
@@ -145,14 +232,24 @@ class RequestHandler {
             inFlight: state.inFlight,
             lastError: state.lastError,
             lastStatus: state.lastStatus,
+            modelCooldowns: Object.fromEntries(
+                Object.entries(state.modelCooldowns || {}).filter(([, until]) => until > Date.now())
+            ),
             rateLimitHits: state.rateLimitHits,
         };
     }
 
-    getNextCooldownMs() {
+    getNextCooldownMs(modelName = null) {
         const now = Date.now();
+        const routeModel = this._normalizeRouteModel(modelName);
         const remaining = [...this.accountRouteState.values()]
-            .map(state => state.cooldownUntil - now)
+            .flatMap(state => {
+                const values = state.cooldownUntil > now ? [state.cooldownUntil - now] : [];
+                if (routeModel && state.modelCooldowns?.[routeModel] > now) {
+                    values.push(state.modelCooldowns[routeModel] - now);
+                }
+                return values;
+            })
             .filter(value => value > 0);
         return remaining.length > 0 ? Math.min(...remaining) : 0;
     }
@@ -160,6 +257,8 @@ class RequestHandler {
     clearAccountCooldown(authIndex) {
         const state = this._getAccountRouteState(authIndex);
         state.cooldownUntil = 0;
+        state.modelCooldowns = {};
+        state.modelRateLimitHits = {};
         state.rateLimitHits = 0;
         state.lastError = null;
         state.lastStatus = null;
@@ -195,7 +294,9 @@ class RequestHandler {
             // otherwise clicking "Test" could immediately send new traffic to
             // the account that was just rate-limited.
             const routeState = this._getAccountRouteState(authIndex);
-            const cooldownActive = routeState.cooldownUntil > Date.now();
+            const cooldownActive =
+                routeState.cooldownUntil > Date.now() ||
+                Object.values(routeState.modelCooldowns || {}).some(until => until > Date.now());
             if (!cooldownActive) {
                 this._markAccountSuccess(authIndex);
             }
@@ -245,6 +346,7 @@ class RequestHandler {
             state.inFlight = Math.max(0, state.inFlight - 1);
         }
         this.requestAuthBindings.delete(requestId);
+        this.requestModelBindings.delete(requestId);
     }
 
     _shouldRotateGlobalAccount() {
@@ -263,10 +365,14 @@ class RequestHandler {
         this.requestFailureCounts.set(source, failureCount);
 
         const status = Number(errorDetails?.status);
+        const modelName = this._normalizeRouteModel(
+            errorDetails?.modelName || this.requestModelBindings.get(requestId)
+        );
         if (status === 429) {
             const state = this._getAccountRouteState(source);
-            if (state.lastStatus !== 429 || state.cooldownUntil <= Date.now()) {
-                this._markAccount429(source, errorDetails);
+            const modelCooldownUntil = modelName ? state.modelCooldowns?.[modelName] || 0 : state.cooldownUntil;
+            if (state.lastStatus !== 429 || modelCooldownUntil <= Date.now()) {
+                this._markAccount429ForModel(source, modelName, errorDetails);
             }
         }
         const immediate = this.config.immediateSwitchStatusCodes.includes(status);
@@ -275,7 +381,7 @@ class RequestHandler {
 
         // Prefer an already-live account. This changes only this request's binding;
         // it does not mutate the global UI/recovery account used by other requests.
-        const nextAuthIndex = this._selectRequestAuthIndex([source]);
+        const nextAuthIndex = this._selectRequestAuthIndex([source], modelName);
         if (nextAuthIndex >= 0) {
             this._bindRequestAuthIndex(requestId, nextAuthIndex);
             this.requestFailureCounts.set(source, 0);
@@ -288,7 +394,7 @@ class RequestHandler {
         if (status === 429) {
             return {
                 rateLimited: true,
-                retryAfterMs: Math.max(0, this.getNextCooldownMs()),
+                retryAfterMs: Math.max(0, this.getNextCooldownMs(modelName)),
                 success: false,
                 switched: false,
             };
@@ -404,6 +510,10 @@ class RequestHandler {
     }
 
     _startTrackedRequest(requestId, req, meta = {}) {
+        const requestedModel = this._getRequestedModel(req);
+        if (requestedModel) {
+            this.requestModelBindings.set(requestId, requestedModel);
+        }
         const usageStatsService = this._getUsageStatsService();
         if (!usageStatsService) return;
 
@@ -420,6 +530,9 @@ class RequestHandler {
     }
 
     _updateTrackedRequest(requestId, patch = {}) {
+        if (typeof requestId === "string" && patch.model) {
+            this.requestModelBindings.set(requestId, this._normalizeRouteModel(patch.model));
+        }
         const usageStatsService = this._getUsageStatsService();
         if (!usageStatsService) return;
         usageStatsService.updateRequest(requestId, patch);
@@ -862,18 +975,23 @@ class RequestHandler {
 
     async _ensureBrowserBackedRequestReady(res, options = {}) {
         const { logPrefix = "Request", waitErrorType = null, waitOptions, authIndex, requestId } = options;
+        const routeModel = this.requestModelBindings.get(requestId) || null;
         let targetAuthIndex = this._getRequestAuthIndex(requestId, authIndex);
 
         if (targetAuthIndex < 0) {
             // Startup/recovery can briefly have no current account while a
             // background context is already ready. Bind to that connection
             // before returning a transient 503.
-            const replacementAuthIndex = this._selectRequestAuthIndex();
+            let replacementAuthIndex = this._selectRequestAuthIndex([], routeModel);
+            if (replacementAuthIndex < 0) {
+                await this._warmStandbyForModel(routeModel);
+                replacementAuthIndex = this._selectRequestAuthIndex([], routeModel);
+            }
             if (replacementAuthIndex >= 0) {
                 targetAuthIndex = replacementAuthIndex;
                 this._bindRequestAuthIndex(requestId, replacementAuthIndex);
             } else {
-                const cooldownMs = this.getNextCooldownMs();
+                const cooldownMs = this.getNextCooldownMs(routeModel);
                 if (cooldownMs > 0) {
                     res.setHeader("Retry-After", Math.ceil(cooldownMs / 1000));
                     this._sendErrorResponse(res, 429, "All accounts are temporarily rate-limited.", waitErrorType);
@@ -907,13 +1025,21 @@ class RequestHandler {
         // waited behind another request that received 429. Re-check the
         // quarantine immediately before touching the browser connection.
         const targetRouteState = this._getAccountRouteState(targetAuthIndex);
-        if (targetRouteState.cooldownUntil > Date.now()) {
-            const replacementAuthIndex = this._selectRequestAuthIndex([targetAuthIndex]);
+        const targetModelCooldownUntil = routeModel ? targetRouteState.modelCooldowns?.[routeModel] || 0 : 0;
+        if (targetRouteState.cooldownUntil > Date.now() || targetModelCooldownUntil > Date.now()) {
+            const replacementAuthIndex = this._selectRequestAuthIndex([targetAuthIndex], routeModel);
             if (replacementAuthIndex >= 0) {
                 targetAuthIndex = replacementAuthIndex;
                 this._bindRequestAuthIndex(requestId, replacementAuthIndex);
             } else {
-                const cooldownMs = this.getNextCooldownMs();
+                await this._warmStandbyForModel(routeModel, [targetAuthIndex]);
+                const warmedAuthIndex = this._selectRequestAuthIndex([], routeModel);
+                if (warmedAuthIndex >= 0) {
+                    targetAuthIndex = warmedAuthIndex;
+                    this._bindRequestAuthIndex(requestId, warmedAuthIndex);
+                    return this._ensureBrowserBackedRequestReady(res, options);
+                }
+                const cooldownMs = this.getNextCooldownMs(routeModel);
                 res.setHeader("Retry-After", Math.max(1, Math.ceil(cooldownMs / 1000)));
                 this._sendErrorResponse(res, 429, "All accounts are temporarily rate-limited.", waitErrorType);
                 this._markTrackedEarlyExitIfNeeded(res, "Assigned account entered 429 cooldown.");
@@ -986,12 +1112,12 @@ class RequestHandler {
         return false;
     }
 
-    _createImmediateSwitchTracker(initialAuthIndex = this.currentAuthIndex) {
+    _createImmediateSwitchTracker(initialAuthIndex = this.currentAuthIndex, modelName = null) {
         const attemptedAuthIndices = new Set();
         if (Number.isInteger(initialAuthIndex) && initialAuthIndex >= 0) {
             attemptedAuthIndices.add(initialAuthIndex);
         }
-        return { attemptedAuthIndices };
+        return { attemptedAuthIndices, modelName: this._normalizeRouteModel(modelName) };
     }
 
     _getImmediateStatusRetryCloseReason(status) {
@@ -1000,7 +1126,10 @@ class RequestHandler {
 
     async _performImmediateSwitchRetry(errorDetails, requestId, tracker) {
         const sourceAuthIndex = this._getRequestAuthIndex(requestId);
-        const nextAuthIndex = this._selectRequestAuthIndex([sourceAuthIndex, ...tracker.attemptedAuthIndices]);
+        const nextAuthIndex = this._selectRequestAuthIndex(
+            [sourceAuthIndex, ...tracker.attemptedAuthIndices],
+            tracker.modelName
+        );
         if (nextAuthIndex >= 0) {
             this._bindRequestAuthIndex(requestId, nextAuthIndex);
             tracker.attemptedAuthIndices.add(nextAuthIndex);
@@ -1062,7 +1191,17 @@ class RequestHandler {
                 );
             }
 
-            const retryAuthIndex = this._selectRequestAuthIndex([sourceAuthIndex, ...tracker.attemptedAuthIndices]);
+            let retryAuthIndex = this._selectRequestAuthIndex(
+                [sourceAuthIndex, ...tracker.attemptedAuthIndices],
+                tracker.modelName
+            );
+            if (retryAuthIndex < 0 && Number(errorDetails?.status) === 429) {
+                await this._warmStandbyForModel(tracker.modelName, [sourceAuthIndex, ...tracker.attemptedAuthIndices]);
+                retryAuthIndex = this._selectRequestAuthIndex(
+                    [sourceAuthIndex, ...tracker.attemptedAuthIndices],
+                    tracker.modelName
+                );
+            }
             if (sourceAuthIndex === retryAuthIndex) {
                 return this._performImmediateSwitchRetry(errorDetails, requestId, tracker);
             }
@@ -1253,7 +1392,7 @@ class RequestHandler {
     // Process standard Google API requests
     async processRequest(req, res) {
         const requestId = this._generateRequestId();
-        const requestAuthIndex = this._selectRequestAuthIndex();
+        const requestAuthIndex = this._selectRequestAuthIndex([], this._getRequestedModel(req));
         this._bindRequestAuthIndex(requestId, requestAuthIndex);
         this._startTrackedRequest(requestId, req, {
             apiFormat: "gemini",
@@ -1350,7 +1489,7 @@ class RequestHandler {
     // Process OpenAI embeddings requests
     async processOpenAIEmbeddingsRequest(req, res) {
         const requestId = this._generateRequestId();
-        const requestAuthIndex = this._selectRequestAuthIndex();
+        const requestAuthIndex = this._selectRequestAuthIndex([], this._getRequestedModel(req));
         this._bindRequestAuthIndex(requestId, requestAuthIndex);
         this._startTrackedRequest(requestId, req, {
             apiFormat: "openai",
@@ -1420,7 +1559,7 @@ class RequestHandler {
     // Process File Upload requests
     async processUploadRequest(req, res) {
         const requestId = this._generateRequestId();
-        const requestAuthIndex = this._selectRequestAuthIndex();
+        const requestAuthIndex = this._selectRequestAuthIndex([], this._getRequestedModel(req));
         this._bindRequestAuthIndex(requestId, requestAuthIndex);
         this.logger.info(`[Upload] Processing upload request ${req.method} ${req.path}, request ID: ${requestId}`);
         this._startTrackedRequest(requestId, req, {
@@ -1517,7 +1656,7 @@ class RequestHandler {
     // Process OpenAI format requests
     async processOpenAIRequest(req, res) {
         const requestId = this._generateRequestId();
-        const requestAuthIndex = this._selectRequestAuthIndex();
+        const requestAuthIndex = this._selectRequestAuthIndex([], this._getRequestedModel(req));
         this._bindRequestAuthIndex(requestId, requestAuthIndex);
         this._startTrackedRequest(requestId, req, {
             apiFormat: "openai",
@@ -1606,7 +1745,10 @@ class RequestHandler {
                     let currentQueueAuthIndex = this._getRequestAuthIndex(requestId, requestAuthIndex);
                     let initialMessage;
                     let skipFinalFailureSwitch = false;
-                    const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);
+                    const immediateSwitchTracker = this._createImmediateSwitchTracker(
+                        currentQueueAuthIndex,
+                        this._getProxyRequestModel(proxyRequest)
+                    );
 
                     // eslint-disable-next-line no-constant-condition
                     while (true) {
@@ -1874,7 +2016,7 @@ class RequestHandler {
     // Process OpenAI Response API format requests
     async processOpenAIResponseRequest(req, res) {
         const requestId = this._generateRequestId();
-        const requestAuthIndex = this._selectRequestAuthIndex();
+        const requestAuthIndex = this._selectRequestAuthIndex([], this._getRequestedModel(req));
         this._bindRequestAuthIndex(requestId, requestAuthIndex);
         this._startTrackedRequest(requestId, req, {
             apiFormat: "response_api",
@@ -2018,7 +2160,10 @@ class RequestHandler {
                     let currentQueueAuthIndex = this._getRequestAuthIndex(requestId, requestAuthIndex);
                     let initialMessage;
                     let skipFinalFailureSwitch = false;
-                    const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);
+                    const immediateSwitchTracker = this._createImmediateSwitchTracker(
+                        currentQueueAuthIndex,
+                        this._getProxyRequestModel(proxyRequest)
+                    );
 
                     // eslint-disable-next-line no-constant-condition
                     while (true) {
@@ -2309,7 +2454,7 @@ class RequestHandler {
     // Process Claude API format requests
     async processClaudeRequest(req, res) {
         const requestId = this._generateRequestId();
-        const requestAuthIndex = this._selectRequestAuthIndex();
+        const requestAuthIndex = this._selectRequestAuthIndex([], this._getRequestedModel(req));
         this._bindRequestAuthIndex(requestId, requestAuthIndex);
         this._startTrackedRequest(requestId, req, {
             apiFormat: "claude",
@@ -2399,7 +2544,10 @@ class RequestHandler {
                     let currentQueueAuthIndex = this._getRequestAuthIndex(requestId, requestAuthIndex);
                     let initialMessage;
                     let skipFinalFailureSwitch = false;
-                    const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);
+                    const immediateSwitchTracker = this._createImmediateSwitchTracker(
+                        currentQueueAuthIndex,
+                        this._getProxyRequestModel(proxyRequest)
+                    );
 
                     // eslint-disable-next-line no-constant-condition
                     while (true) {
@@ -2656,7 +2804,7 @@ class RequestHandler {
     // Process Claude count tokens request
     async processClaudeCountTokens(req, res) {
         const requestId = this._generateRequestId();
-        const requestAuthIndex = this._selectRequestAuthIndex();
+        const requestAuthIndex = this._selectRequestAuthIndex([], this._getRequestedModel(req));
         this._bindRequestAuthIndex(requestId, requestAuthIndex);
         this.logger.info(`[Request] Claude count tokens request started, request ID: ${requestId}`);
         this._startTrackedRequest(requestId, req, {
@@ -2804,7 +2952,7 @@ class RequestHandler {
     // Mirrors OpenAI's /v1/responses/input_tokens by returning only the request-side token count.
     async processOpenAIResponseInputTokens(req, res) {
         const requestId = this._generateRequestId();
-        const requestAuthIndex = this._selectRequestAuthIndex();
+        const requestAuthIndex = this._selectRequestAuthIndex([], this._getRequestedModel(req));
         this._bindRequestAuthIndex(requestId, requestAuthIndex);
         this.logger.info(`[Request] OpenAI Response input_tokens request started, request ID: ${requestId}`);
         this._startTrackedRequest(requestId, req, {
@@ -3367,7 +3515,10 @@ class RequestHandler {
         let currentQueueAuthIndex = this._getRequestAuthIndex(proxyRequest.request_id, this.currentAuthIndex);
         let headerMessage;
         let skipFinalFailureSwitch = false;
-        const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);
+        const immediateSwitchTracker = this._createImmediateSwitchTracker(
+            currentQueueAuthIndex,
+            this._getProxyRequestModel(proxyRequest)
+        );
 
         // eslint-disable-next-line no-constant-condition
         while (true) {
@@ -3671,7 +3822,10 @@ class RequestHandler {
                 ? registeredQueueAuthIndex
                 : this.currentAuthIndex;
         let retryAttempt = 1;
-        const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);
+        const immediateSwitchTracker = this._createImmediateSwitchTracker(
+            currentQueueAuthIndex,
+            this._getProxyRequestModel(proxyRequest)
+        );
 
         while (retryAttempt <= this.config.maxRetries) {
             // Record attempt at the start of each retry, before forwarding.
@@ -3702,7 +3856,7 @@ class RequestHandler {
                 }
 
                 // A successful response resets the account's transient 429 streak.
-                this._markAccountSuccess(currentQueueAuthIndex);
+                this._markAccountSuccess(currentQueueAuthIndex, this._getProxyRequestModel(proxyRequest));
                 // Success, return the initial message and the queue that received it
                 return { message: initialMessage, queue: currentQueue, success: true };
             } catch (error) {
@@ -3724,7 +3878,10 @@ class RequestHandler {
                     // Check the actual closure reason to provide accurate error messages
                     const reason = error.reason || "unknown";
                     const isClientDisconnect = reason === "client_disconnect";
-                    const currentAuthIndex = this._selectRequestAuthIndex([currentQueueAuthIndex]);
+                    const currentAuthIndex = this._selectRequestAuthIndex(
+                        [currentQueueAuthIndex],
+                        this._getProxyRequestModel(proxyRequest)
+                    );
                     const isClosedAccountRetryable = reason === "context_closed" || reason === "page_closed";
                     const canRetryOnCurrentAccountCandidate =
                         !isClientDisconnect &&
@@ -3795,7 +3952,13 @@ class RequestHandler {
                 this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
 
                 const errorStatus = Number(errorPayload?.status);
-                if (errorStatus === 429) this._markAccount429(currentQueueAuthIndex, errorPayload);
+                if (errorStatus === 429) {
+                    this._markAccount429ForModel(
+                        currentQueueAuthIndex,
+                        this._getProxyRequestModel(proxyRequest),
+                        errorPayload
+                    );
+                }
                 const isNonRetryableEmbeddingClientError =
                     (errorStatus === 400 || errorStatus === 404) &&
                     this._categorizeRequest(proxyRequest?.path, "request") === "embedding";

@@ -29,6 +29,9 @@ cache/
 # Usage statistics data
 data/
 
+# Runtime settings are created and managed by the Web UI
+configs/runtime-settings.json
+
 # Temporary files
 tmp/
 temp/

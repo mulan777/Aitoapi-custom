@@ -32,6 +32,7 @@ const makeHandler = () => {
     };
     handler.logger = { debug() {}, info() {}, warn() {} };
     handler.requestAuthBindings = new Map();
+    handler.requestModelBindings = new Map();
     handler.requestRouteCursor = 0;
     handler.requestFailureCounts = new Map();
     handler.accountRouteState = new Map();
@@ -91,6 +92,22 @@ const test429QuarantinesAccount = () => {
         assert.strictEqual(result.rateLimited, true);
         assert.strictEqual(handler.authSwitcher.called, false);
     });
+};
+
+const test429IsScopedToModel = () => {
+    const { handler } = makeHandler();
+    handler._markAccount429ForModel(0, "gemini-3.8-flash", { message: "flash quota", status: 429 });
+
+    assert.strictEqual(handler._selectRequestAuthIndex([1], "gemini-3.8-flash"), -1);
+    assert.strictEqual(handler._selectRequestAuthIndex([1], "gemini-3.7-flash"), 0);
+    assert.ok(handler.getAccountRouteStatus(0).modelCooldowns["gemini-3.8-flash"]);
+    assert.strictEqual(handler.getAccountRouteStatus(0).modelCooldowns["gemini-3.7-flash"], undefined);
+};
+
+const testModelNormalization = () => {
+    const { handler } = makeHandler();
+    assert.strictEqual(handler._normalizeRouteModel("models/gemini-3.8-flash-minimal-fake-search"), "gemini-3.8-flash");
+    assert.strictEqual(handler._normalizeRouteModel("/gemini-3.7-flash(high)"), "gemini-3.7-flash");
 };
 
 const testForwardUsesSelectedAccount = () => {
@@ -153,6 +170,8 @@ const testReadyCheckMovesQueuedRequestOffCooldownAccount = async () => {
     await testFailureDoesNotGloballySwitch();
     testLeastLoadedTieBreak();
     await test429QuarantinesAccount();
+    test429IsScopedToModel();
+    testModelNormalization();
     testForwardUsesSelectedAccount();
     await testAccountTestPreservesActiveCooldown();
     await testReadyCheckMovesQueuedRequestOffCooldownAccount();

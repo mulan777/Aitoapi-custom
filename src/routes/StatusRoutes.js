@@ -22,6 +22,7 @@ class StatusRoutes {
         this.logger = serverSystem.logger;
         this.config = serverSystem.config;
         this.distIndexPath = serverSystem.distIndexPath;
+        this.runtimeSettingsPath = path.join(process.cwd(), "configs", "runtime-settings.json");
         this.versionChecker = new VersionChecker(this.logger);
         this.allowedSafetyThresholds = new Set([
             "HARM_BLOCK_THRESHOLD_UNSPECIFIED",
@@ -42,6 +43,28 @@ class StatusRoutes {
             error: "System is busy switching or recovering accounts. Please try again later.",
             message: "systemBusySwitchingOrRecoveringAccounts",
         });
+    }
+
+    async _saveRuntimeSettings() {
+        const runtimeSettings = {
+            accountCooldownMaxMs: this.config.accountCooldownMaxMs,
+            accountCooldownMs: this.config.accountCooldownMs,
+            maxContexts: this.config.maxContexts,
+        };
+        const directory = path.dirname(this.runtimeSettingsPath);
+        await fs.promises.mkdir(directory, { recursive: true });
+        const temporaryPath = `${this.runtimeSettingsPath}.tmp`;
+        await fs.promises.writeFile(temporaryPath, `${JSON.stringify(runtimeSettings, null, 2)}\n`, "utf8");
+        // Windows does not replace an existing destination with rename() on
+        // every supported filesystem. Remove only this exact generated file
+        // before moving the validated temporary file into place.
+        try {
+            await fs.promises.rm(this.runtimeSettingsPath, { force: true });
+        } catch (error) {
+            await fs.promises.rm(temporaryPath, { force: true }).catch(() => {});
+            throw error;
+        }
+        await fs.promises.rename(temporaryPath, this.runtimeSettingsPath);
     }
 
     /**
@@ -828,6 +851,50 @@ class StatusRoutes {
             }
         });
 
+        const updateNumericSetting = async (req, res, setting, { max, min = 0 } = {}) => {
+            const value = Number(req.body?.value);
+            if (!Number.isInteger(value) || value < min || (max !== undefined && value > max)) {
+                return res.status(400).json({ error: `Invalid value for ${setting}.`, message: "settingFailed" });
+            }
+            if (setting === "accountCooldownMaxMs" && value < this.config.accountCooldownMs) {
+                return res.status(400).json({
+                    error: "Maximum account cooldown must be greater than or equal to the base cooldown.",
+                    message: "settingFailed",
+                });
+            }
+            if (setting === "accountCooldownMs" && value > this.config.accountCooldownMaxMs) {
+                this.config.accountCooldownMaxMs = value;
+            }
+            this.config[setting] = value;
+            try {
+                await this._saveRuntimeSettings();
+            } catch (error) {
+                this.logger.error(`[WebUI] Failed to persist numeric setting ${setting}: ${error.message}`);
+                return res.status(500).json({ error: "Failed to persist setting.", message: "settingFailed" });
+            }
+            this.logger.info(`[WebUI] Numeric setting ${setting} updated to ${value}`);
+            if (setting === "maxContexts") {
+                this.serverSystem.browserManager.rebalanceContextPool().catch(error => {
+                    this.logger.error(`[WebUI] Context pool rebalance failed: ${error.message}`);
+                });
+            }
+            return res.status(200).json({
+                message: "settingUpdateSuccess",
+                setting,
+                value,
+            });
+        };
+
+        app.put("/api/settings/max-contexts", isAuthenticated, (req, res) =>
+            updateNumericSetting(req, res, "maxContexts", { max: 1000, min: 0 })
+        );
+        app.put("/api/settings/account-cooldown-ms", isAuthenticated, (req, res) =>
+            updateNumericSetting(req, res, "accountCooldownMs", { max: 86400000, min: 1000 })
+        );
+        app.put("/api/settings/account-cooldown-max-ms", isAuthenticated, (req, res) =>
+            updateNumericSetting(req, res, "accountCooldownMaxMs", { max: 604800000, min: 1000 })
+        );
+
         app.post("/api/files", isAuthenticated, async (req, res) => {
             if (this._rejectIfSystemBusy(res)) return;
 
@@ -1031,6 +1098,8 @@ class StatusRoutes {
             logCount: displayLogs.length,
             logs: displayLogs.join("\n"),
             status: {
+                accountCooldownMaxMs: config.accountCooldownMaxMs,
+                accountCooldownMs: config.accountCooldownMs,
                 accountDetails,
                 activeContextsCount: browserManager.contexts.size,
                 apiKeySource: config.apiKeySource,

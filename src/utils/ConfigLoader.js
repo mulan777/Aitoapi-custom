@@ -104,6 +104,12 @@ class ConfigLoader {
                 ? Math.max(config.accountCooldownMs, parsed)
                 : config.accountCooldownMaxMs;
         }
+
+        // Settings changed from the Web UI are kept in a small local runtime
+        // file. Environment variables remain the bootstrap/default source;
+        // the runtime file is applied afterwards so a UI change survives a
+        // process restart without rewriting .env or exposing credentials.
+        this._applyRuntimeSettings(config);
         if (process.env.CAMOUFOX_EXECUTABLE_PATH) config.browserExecutablePath = process.env.CAMOUFOX_EXECUTABLE_PATH;
         if (process.env.API_KEYS) {
             config.apiKeys = process.env.API_KEYS.split(",");
@@ -203,6 +209,32 @@ class ConfigLoader {
 
         this._printConfiguration(config);
         return config;
+    }
+
+    _applyRuntimeSettings(config) {
+        const runtimeSettingsPath = path.join(process.cwd(), "configs", "runtime-settings.json");
+        if (!fs.existsSync(runtimeSettingsPath)) return;
+
+        try {
+            const raw = JSON.parse(fs.readFileSync(runtimeSettingsPath, "utf-8"));
+            if (!raw || typeof raw !== "object") return;
+
+            const isIntegerInRange = (value, min, max) => Number.isInteger(value) && value >= min && value <= max;
+
+            if (isIntegerInRange(raw.maxContexts, 0, 1000)) config.maxContexts = raw.maxContexts;
+            if (isIntegerInRange(raw.accountCooldownMs, 1000, 86400000)) {
+                config.accountCooldownMs = raw.accountCooldownMs;
+            }
+            if (isIntegerInRange(raw.accountCooldownMaxMs, 1000, 604800000)) {
+                config.accountCooldownMaxMs = Math.max(config.accountCooldownMs, raw.accountCooldownMaxMs);
+            }
+            if (config.accountCooldownMaxMs < config.accountCooldownMs) {
+                config.accountCooldownMaxMs = config.accountCooldownMs;
+            }
+            this.logger.info(`[Config] Applied runtime settings from ${runtimeSettingsPath}.`);
+        } catch (error) {
+            this.logger.warn(`[Config] Ignoring invalid runtime settings file: ${error.message}`);
+        }
     }
 
     _printConfiguration(config) {

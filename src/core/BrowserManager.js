@@ -1956,6 +1956,36 @@ class BrowserManager {
     }
 
     /**
+     * Warm one standby account without changing the global current account.
+     * This is used when every currently warm context is out of quota for the
+     * requested model but the auth pool still contains standby accounts.
+     */
+    async ensureContextForAuth(authIndex) {
+        if (!Number.isInteger(authIndex) || authIndex < 0) return false;
+        if (this.contexts.has(authIndex)) return true;
+        if (this.initializingContexts.has(authIndex)) {
+            await this._waitForContextInit(authIndex);
+            return this.contexts.has(authIndex);
+        }
+
+        await this.preCleanupForSwitch(authIndex);
+        const maxContexts = this.config.maxContexts;
+        if (maxContexts > 0 && this.contexts.size + this.initializingContexts.size >= maxContexts) {
+            return false;
+        }
+        if (!this.browser) await this._ensureBrowser();
+
+        this.initializingContexts.add(authIndex);
+        try {
+            await this._initializeContext(authIndex, true);
+            return this.contexts.has(authIndex);
+        } catch (error) {
+            this.logger.warn(`[ContextPool] Standby account #${authIndex} warm-up failed: ${error.message}`);
+            return false;
+        }
+    }
+
+    /**
      * Rebalance context pool after account changes
      * Removes excess contexts and starts missing ones in background
      */

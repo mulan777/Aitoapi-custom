@@ -836,6 +836,16 @@
                                         <span v-if="item.route?.cooldownUntil" class="expired-badge">
                                             {{ t("accountCooldown") }}
                                         </span>
+                                        <span
+                                            v-else-if="
+                                                item.route?.modelCooldowns &&
+                                                Object.keys(item.route.modelCooldowns).length
+                                            "
+                                            class="expired-badge"
+                                            :title="Object.keys(item.route.modelCooldowns).join(', ')"
+                                        >
+                                            {{ t("accountModelCooldown") }}
+                                        </span>
                                         <span v-else-if="item.route?.inFlight > 0" class="current-badge">
                                             {{ t("accountInFlight") }}: {{ item.route.inFlight }}
                                         </span>
@@ -1231,6 +1241,54 @@
                                     v-model="state.enableAuthUpdateEnabled"
                                     :width="50"
                                     :before-change="handleEnableAuthUpdateBeforeChange"
+                                />
+                            </div>
+                            <div class="switch-container">
+                                <span class="label">
+                                    <span>
+                                        {{ t("maxContexts") }}
+                                        <EnvVarTooltip env-var="MAX_CONTEXTS" doc-section="proxy-config" />
+                                    </span>
+                                </span>
+                                <el-input-number
+                                    v-model="state.maxContexts"
+                                    :min="0"
+                                    :max="1000"
+                                    :step="1"
+                                    controls-position="right"
+                                    @change="handleMaxContextsChange"
+                                />
+                            </div>
+                            <div class="switch-container">
+                                <span class="label">
+                                    <span>
+                                        {{ t("accountCooldownMs") }}
+                                        <EnvVarTooltip env-var="ACCOUNT_COOLDOWN_MS" doc-section="proxy-config" />
+                                    </span>
+                                </span>
+                                <el-input-number
+                                    v-model="state.accountCooldownMs"
+                                    :min="1000"
+                                    :max="86400000"
+                                    :step="1000"
+                                    controls-position="right"
+                                    @change="handleAccountCooldownChange"
+                                />
+                            </div>
+                            <div class="switch-container">
+                                <span class="label">
+                                    <span>
+                                        {{ t("accountCooldownMaxMs") }}
+                                        <EnvVarTooltip env-var="ACCOUNT_COOLDOWN_MAX_MS" doc-section="proxy-config" />
+                                    </span>
+                                </span>
+                                <el-input-number
+                                    v-model="state.accountCooldownMaxMs"
+                                    :min="state.accountCooldownMs"
+                                    :max="604800000"
+                                    :step="1000"
+                                    controls-position="right"
+                                    @change="handleAccountCooldownMaxChange"
                                 />
                             </div>
                         </div>
@@ -3723,6 +3781,8 @@ const switchTab = tabName => {
 const { theme, setTheme } = useTheme();
 
 const state = reactive({
+    accountCooldownMaxMs: 1800000,
+    accountCooldownMs: 300000,
     accountDetails: [],
     activeContextsCount: 0,
     apiKeySource: "",
@@ -4233,6 +4293,47 @@ const handleCheckUpdateBeforeChange = () => handleSettingChange("/api/settings/c
 const handleEnableAuthUpdateBeforeChange = () =>
     handleSettingChange("/api/settings/enable-auth-update", "enableAuthUpdate");
 
+const handleNumericSettingChange = async (apiUrl, settingName, value) => {
+    const numericValue = Number(value);
+    if (!Number.isInteger(numericValue)) return;
+    await updateNumericSetting(apiUrl, settingName, numericValue);
+};
+
+const handleMaxContextsChange = value => handleNumericSettingChange("/api/settings/max-contexts", "maxContexts", value);
+
+const handleAccountCooldownChange = value =>
+    handleNumericSettingChange("/api/settings/account-cooldown-ms", "accountCooldownMs", value);
+
+const handleAccountCooldownMaxChange = value =>
+    handleNumericSettingChange("/api/settings/account-cooldown-max-ms", "accountCooldownMaxMs", value);
+
+const updateNumericSetting = async (apiUrl, settingName, value) => {
+    try {
+        const res = await fetch(apiUrl, {
+            body: JSON.stringify({ value }),
+            headers: { "Content-Type": "application/json" },
+            method: "PUT",
+        });
+        const data = await res.json();
+        if (!res.ok) {
+            ElMessage.error(t(data.message || "settingFailed", { message: data.error || "" }));
+            await updateContent();
+            return false;
+        }
+        ElMessage.success(
+            t(data.message, {
+                setting: t(settingName),
+                value: data.value,
+            })
+        );
+        await updateContent();
+        return true;
+    } catch (error) {
+        ElMessage.error(t("settingFailed", { message: error.message || error }));
+        return false;
+    }
+};
+
 // Handle change specifically for Select component which might trigger logic differently
 const handleStatsDebugChange = val => {
     handleSettingChange("/api/settings/debug-mode", "logLevel").then(success => {
@@ -4492,6 +4593,8 @@ const updateStatus = data => {
     state.currentAuthIndex = data.status.currentAuthIndex;
     state.accountDetails = data.status.accountDetails || [];
     state.activeContextsCount = data.status.activeContextsCount || 0;
+    state.accountCooldownMaxMs = data.status.accountCooldownMaxMs ?? 1800000;
+    state.accountCooldownMs = data.status.accountCooldownMs ?? 300000;
     state.maxContexts = data.status.maxContexts ?? 1;
     state.maxRetries = data.status.maxRetries ?? 3;
     state.safetySettingsThreshold = data.status.safetySettingsThreshold || "OFF";
