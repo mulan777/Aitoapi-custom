@@ -1091,7 +1091,8 @@
                                     >
                                         <a
                                             :href="
-                                                state.releaseUrl || 'https://github.com/mulan777/Aitoapi-custom/releases'
+                                                state.releaseUrl ||
+                                                'https://github.com/mulan777/Aitoapi-custom/releases'
                                             "
                                             target="_blank"
                                             class="update-link"
@@ -1101,7 +1102,8 @@
                                         <a
                                             class="copy-icon"
                                             :href="
-                                                state.releaseUrl || 'https://github.com/mulan777/Aitoapi-custom/releases'
+                                                state.releaseUrl ||
+                                                'https://github.com/mulan777/Aitoapi-custom/releases'
                                             "
                                             target="_blank"
                                             style="color: inherit; display: inline-flex"

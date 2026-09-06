@@ -39,6 +39,10 @@ class BrowserManager {
         this.stickyProxyManager = new StickyProxyManager(logger, authSource);
         this.stickyProxyManager.isEnabled();
         this.browser = null;
+        // Startup and the first incoming request can arrive at the same time.
+        // Keep browser launch single-flight so concurrent callers share one
+        // Playwright instance instead of creating two browsers for one account.
+        this._browserLaunchPromise = null;
 
         // Multi-context architecture: Store all initialized contexts
         // Map: authIndex -> {context, page, healthMonitorInterval}
@@ -1520,37 +1524,55 @@ class BrowserManager {
      */
     async _ensureBrowser() {
         if (this.browser) return;
+        if (this._browserLaunchPromise) {
+            await this._browserLaunchPromise;
+            return this.browser;
+        }
 
-        const isStickyProxyEnabled = this.stickyProxyManager.isEnabled();
-        const proxyConfig = isStickyProxyEnabled ? null : parseProxyFromEnv();
-        if (isStickyProxyEnabled) {
-            this.logger.info(
-                "[Browser] Sticky proxy mode enabled; main browser launch will not use environment proxy."
-            );
-        }
-        this.logger.info("🚀 [Browser] Launching main browser instance...");
-        const browserExecutablePath = this._getBrowserExecutablePath();
-        if (!fs.existsSync(browserExecutablePath)) {
-            this._currentAuthIndex = -1;
-            throw new Error(`Browser executable not found at path: ${browserExecutablePath}`);
-        }
-        this.browser = await firefox.launch({
-            args: this.launchArgs,
-            executablePath: browserExecutablePath,
-            firefoxUserPrefs: this.firefoxUserPrefs,
-            headless: true,
-            ...(proxyConfig ? { proxy: proxyConfig } : {}),
-        });
-        this.browser.on("disconnected", () => {
-            if (!this.isClosingIntentionally) {
-                this.logger.error("❌ [Browser] Main browser unexpectedly disconnected!");
-            } else {
-                this.logger.debug("[Browser] Main browser closed intentionally.");
+        this._browserLaunchPromise = (async () => {
+            if (this.browser) return this.browser;
+
+            const isStickyProxyEnabled = this.stickyProxyManager.isEnabled();
+            const proxyConfig = isStickyProxyEnabled ? null : parseProxyFromEnv();
+            if (isStickyProxyEnabled) {
+                this.logger.info(
+                    "[Browser] Sticky proxy mode enabled; main browser launch will not use environment proxy."
+                );
             }
-            this.browser = null;
-            this._cleanupAllContexts();
-        });
-        this.logger.info("✅ [Browser] Main browser instance launched successfully.");
+            this.logger.info("🚀 [Browser] Launching main browser instance...");
+            const browserExecutablePath = this._getBrowserExecutablePath();
+            if (!fs.existsSync(browserExecutablePath)) {
+                this._currentAuthIndex = -1;
+                throw new Error(`Browser executable not found at path: ${browserExecutablePath}`);
+            }
+            const browser = await firefox.launch({
+                args: this.launchArgs,
+                executablePath: browserExecutablePath,
+                firefoxUserPrefs: this.firefoxUserPrefs,
+                headless: true,
+                ...(proxyConfig ? { proxy: proxyConfig } : {}),
+            });
+            this.browser = browser;
+            browser.on("disconnected", () => {
+                if (!this.isClosingIntentionally) {
+                    this.logger.error("❌ [Browser] Main browser unexpectedly disconnected!");
+                } else {
+                    this.logger.debug("[Browser] Main browser closed intentionally.");
+                }
+                if (this.browser === browser) {
+                    this.browser = null;
+                    this._cleanupAllContexts();
+                }
+            });
+            this.logger.info("✅ [Browser] Main browser instance launched successfully.");
+            return browser;
+        })();
+
+        try {
+            await this._browserLaunchPromise;
+        } finally {
+            this._browserLaunchPromise = null;
+        }
     }
 
     /**
