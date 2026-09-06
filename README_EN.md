@@ -4,7 +4,7 @@
 
 > **Project lineage and license**
 >
-> `mulan777/AIStudioToAPI-custom` is a modified version based on [iBUHub/AIStudioToAPI](https://github.com/iBUHub/AIStudioToAPI), whose upstream project is [Ellinav/ais2api](https://github.com/Ellinav/ais2api). Thanks to the upstream authors and contributors.
+> `mulan777/AIStudioToAPI-custom` is developed based on [iBUHub/AIStudioToAPI](https://github.com/iBUHub/AIStudioToAPI) and [Ellinav/ais2api](https://github.com/Ellinav/ais2api). Thanks to both upstream authors and their contributors.
 >
 > This project and the upstream-derived code use the **CC BY-NC 4.0** license. Non-commercial copying, modification, and distribution are permitted only when the license terms are followed. Redistributed derivatives must retain the original attribution, upstream links, and license notice, and must clearly identify modifications. This project is not an official upstream release and does not imply upstream endorsement. Obtain additional permission from the relevant rights holders before any commercial use. See [`LICENSE`](LICENSE) for the complete terms.
 
