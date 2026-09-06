@@ -976,6 +976,25 @@ class RequestHandler {
     async _ensureBrowserBackedRequestReady(res, options = {}) {
         const { logPrefix = "Request", waitErrorType = null, waitOptions, authIndex, requestId } = options;
         const routeModel = this.requestModelBindings.get(requestId) || null;
+
+        // HTTP starts listening before the initial context pool is ready. A
+        // health check or client request during that window must wait for the
+        // single startup workflow instead of launching a second browser or
+        // aborting its background preload.
+        if (this.authSwitcher.isSystemBusy) {
+            const systemReady = await this._waitForSystemReady();
+            if (!systemReady) {
+                this._sendErrorResponse(
+                    res,
+                    503,
+                    "Service temporarily unavailable: browser startup is still in progress.",
+                    waitErrorType
+                );
+                this._markTrackedEarlyExitIfNeeded(res, "Initial browser startup did not finish in time.");
+                return false;
+            }
+        }
+
         let targetAuthIndex = this._getRequestAuthIndex(requestId, authIndex);
 
         if (targetAuthIndex < 0) {
