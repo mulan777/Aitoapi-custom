@@ -350,7 +350,7 @@ NO_PROXY=internal.example.com,10.0.0.0/8
 
 ## 📄 License
 
-This project is a fork of [**ais2api**](https://github.com/Ellinav/ais2api) by [**Ellinav**](https://github.com/Ellinav), and fully adopts the CC BY-NC 4.0 license used by the upstream project. All usage, distribution, and modification activities must comply with all terms of the original license. See the full license text in [LICENSE](LICENSE).
+This project is developed based on [iBUHub/AIStudioToAPI](https://github.com/iBUHub/AIStudioToAPI) and [Ellinav/ais2api](https://github.com/Ellinav/ais2api), maintained and published by `mulan777`, and uses the **CC BY-NC 4.0** license. All usage, distribution, and modification must comply with the full license terms. See [`LICENSE`](LICENSE) for the complete license text.
 
 ## 🤝 Contributors
 

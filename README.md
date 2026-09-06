@@ -4,7 +4,7 @@
 
 > **项目来源与许可证**
 >
-> 本项目 `mulan777/AIStudioToAPI-custom` 基于 [iBUHub/AIStudioToAPI](https://github.com/iBUHub/AIStudioToAPI) 进行二次开发；`iBUHub/AIStudioToAPI` 的上游项目为 [Ellinav/ais2api](https://github.com/Ellinav/ais2api)。感谢上游作者和贡献者。
+> 本项目 `mulan777/AIStudioToAPI-custom` 基于 [iBUHub/AIStudioToAPI](https://github.com/iBUHub/AIStudioToAPI) 和 [Ellinav/ais2api](https://github.com/Ellinav/ais2api) 进行二次开发；感谢两位上游作者和贡献者。
 >
 > 本项目及其中来自上游的代码沿用 **CC BY-NC 4.0** 许可证。允许在遵守许可证条款的前提下进行非商业性的复制、修改和分发；发布二开版本时请保留原作者署名、上游项目链接和许可证声明，并明确标注修改内容。不得暗示上游作者对本项目提供官方认可或背书。商业用途请先取得相应权利人的许可，完整条款请参见 [`LICENSE`](LICENSE)。
 
@@ -352,7 +352,7 @@ NO_PROXY=internal.example.com,10.0.0.0/8
 
 ## 📄 许可证
 
-本项目基于 [**ais2api**](https://github.com/Ellinav/ais2api)（作者：[**Ellinav**](https://github.com/Ellinav)）分支开发，并完全沿用上游项目所采用的 CC BY-NC 4.0 许可证，其使用、分发与修改行为均需遵守原有许可证的全部条款，完整许可的内容请参见 [LICENSE](LICENSE) 文件。
+本项目基于 [iBUHub/AIStudioToAPI](https://github.com/iBUHub/AIStudioToAPI) 和 [Ellinav/ais2api](https://github.com/Ellinav/ais2api) 进行二次开发，由 `mulan777` 维护发布，并沿用 **CC BY-NC 4.0** 许可证。其使用、分发与修改行为均需遵守许可证全部条款，完整许可内容请参见 [`LICENSE`](LICENSE)。
 
 ## 🤝 贡献者
 
