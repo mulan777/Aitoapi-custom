@@ -15,6 +15,7 @@
         "quick-start": "cross-env NODE_ENV=production node main.js",
         "test:routing": "node scripts/tests/requestRouting.test.js",
         "test:background-wakeup": "node scripts/tests/backgroundWakeup.test.js",
+        "test:model-suffix": "node scripts/tests/modelSuffix.test.js",
         "prestart": "npm run build:ui",
         "save-auth": "node scripts/auth/saveAuth.js",
         "setup-auth": "node scripts/auth/setupAuth.js",

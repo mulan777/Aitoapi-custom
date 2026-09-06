@@ -318,6 +318,8 @@ Edit `configs/models.json` to customize available models and their settings.
 >
 > Web search and code execution can also be forced on with model suffixes: append `-search` for web search and `-code` for code execution. For example: `gemini-3-flash-preview-search` or `gemini-3-flash-preview-code`. When combined with other suffixes, built-in tool suffixes should come last; the full combined order is `thinking -> streaming -> built-in tools`, for example: `gemini-3-flash-preview-minimal-search`, `gemini-3-flash-preview-real-code`, or `gemini-3-flash-preview(minimal)-fake-search-code`.
 
+For thinking-capable conversational models, the model discovery endpoints also list common combinations such as `gemini-3-flash-preview-high-fake-search`. These are request-routing aliases for the same base model and do not create separate quotas.
+
 ### 🌐 Sticky Per-Account Proxy
 
 Create `proxylist.txt` in the project root to enable sticky per-account proxies. Add one HTTP proxy per line. Supported formats:

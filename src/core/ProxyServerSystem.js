@@ -23,6 +23,7 @@ const RequestHandler = require("./RequestHandler");
 const UsageStatsService = require("./UsageStatsService");
 const ConfigLoader = require("../utils/ConfigLoader");
 const WebRoutes = require("../routes/WebRoutes");
+const FormatConverter = require("./FormatConverter");
 
 /**
  * Proxy Server System
@@ -461,9 +462,14 @@ class ProxyServerSystem extends EventEmitter {
         app.use(this._createAuthMiddleware());
 
         // API routes
+        // Keep the suffix variants visible in model discovery.  Request
+        // conversion already supports these names; without this expansion
+        // clients lose the selectable `-high-fake-search` style entries.
+        const discoverableModels = FormatConverter.expandModelListWithSuffixes(this.config.modelList);
+
         app.get(["/v1/models"], (req, res) => {
             // OpenAI format
-            const models = this.config.modelList.map(model => ({
+            const models = discoverableModels.map(model => ({
                 context_window: model.inputTokenLimit,
                 created: Math.floor(Date.now() / 1000),
                 id: model.name.replace("models/", ""),
@@ -479,7 +485,7 @@ class ProxyServerSystem extends EventEmitter {
         });
 
         app.get(["/v1beta/models"], (req, res) => {
-            res.status(200).json({ models: this.config.modelList });
+            res.status(200).json({ models: discoverableModels });
         });
 
         app.post("/v1/chat/completions", (req, res) => {

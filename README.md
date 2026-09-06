@@ -320,6 +320,8 @@ services:
 >
 > 联网搜索和代码执行也支持通过模型名后缀强制开启：联网搜索追加 `-search`，代码执行追加 `-code`。例如：`gemini-3-flash-preview-search` 或 `gemini-3-flash-preview-code`。若和其他后缀同时使用，内置工具后缀放在最后；完整组合顺序为“思考 -> 流式 -> 内置工具”，例如：`gemini-3-flash-preview-minimal-search`、`gemini-3-flash-preview-real-code` 或 `gemini-3-flash-preview(minimal)-fake-search-code`。
 
+对于支持思考的对话模型，模型发现接口也会列出常用组合，例如 `gemini-3-flash-preview-high-fake-search`。模型发现列表中的后缀只是同一基础模型的请求路由别名，不会复制模型配额。
+
 ### 🌐 账号固定代理
 
 在项目根目录创建 `proxylist.txt` 即可启用账号固定代理。每行填写一个 HTTP 代理，支持以下格式：

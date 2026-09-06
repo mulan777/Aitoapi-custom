@@ -168,6 +168,73 @@ class FormatConverter {
         return { cleanModelName: modelName, thinkingLevel: null };
     }
 
+    /**
+     * Expand the discoverable model list with the supported model-name
+     * directives.  The request parsers already understand these suffixes,
+     * but removing this expansion makes them disappear from /v1/models and
+     * /v1beta/models even though direct requests still work.
+     *
+     * The generated order is intentionally kept compatible with the former
+     * implementation:
+     *   base
+     *   -search
+     *   -<thinking>
+     *   -<thinking>-fake
+     *   -<thinking>-search
+     *   -<thinking>-fake-search
+     *
+     * `-code` is included for the same conversational models because the
+     * current parser supports the code-execution directive as well.
+     *
+     * @param {Array<object>} models - Base model metadata entries
+     * @returns {Array<object>} Base entries plus discoverable suffix variants
+     */
+    static expandModelListWithSuffixes(models) {
+        const expanded = [];
+        const seenNames = new Set();
+        const thinkingLevels = Object.keys(FormatConverter.THINKING_LEVEL_MAP);
+
+        const addModel = (model, suffix = "") => {
+            if (!model || typeof model !== "object" || !model.name) return;
+            const name = `${model.name}${suffix}`;
+            if (seenNames.has(name)) return;
+            seenNames.add(name);
+            expanded.push({ ...model, name });
+        };
+
+        for (const model of Array.isArray(models) ? models : []) {
+            addModel(model);
+
+            const name = String(model?.name || "");
+            const methods = Array.isArray(model?.supportedGenerationMethods) ? model.supportedGenerationMethods : [];
+            const isConversationalGemini =
+                /^models\/gemini-/i.test(name) &&
+                methods.includes("generateContent") &&
+                !/(?:image|tts|embedding|computer-use|robotics)/i.test(name);
+
+            if (!isConversationalGemini) continue;
+
+            addModel(model, "-search");
+            addModel(model, "-code");
+            addModel(model, "-search-code");
+
+            if (model.thinking !== true) continue;
+
+            for (const level of thinkingLevels) {
+                addModel(model, `-${level}`);
+                addModel(model, `-${level}-fake`);
+                addModel(model, `-${level}-search`);
+                addModel(model, `-${level}-fake-search`);
+                addModel(model, `-${level}-code`);
+                addModel(model, `-${level}-fake-code`);
+                addModel(model, `-${level}-search-code`);
+                addModel(model, `-${level}-fake-search-code`);
+            }
+        }
+
+        return expanded;
+    }
+
     constructor(logger, serverSystem) {
         this.logger = logger;
         this.serverSystem = serverSystem;
