@@ -398,6 +398,18 @@
                                 </span>
                                 <span class="value">{{ activeContextsDisplay }}</span>
                             </div>
+                            <div class="status-item">
+                                <span class="label">{{ t("routingPoolSize") }}</span>
+                                <span class="value">{{
+                                    state.routingPoolSize === 0 ? "∞" : state.routingPoolSize
+                                }}</span>
+                            </div>
+                            <div class="status-item">
+                                <span class="label">{{ t("warmStandbyContexts") }}</span>
+                                <span class="value"
+                                    >{{ state.warmStandbyReadyWebSocketCount }} / {{ state.warmStandbyContexts }}</span
+                                >
+                            </div>
                         </div>
                     </div>
 
@@ -921,13 +933,13 @@
                                         class="btn-switch"
                                         :class="{
                                             'is-active': item.index === state.currentAuthIndex,
-                                            'is-fast': item.hasContext && item.index !== state.currentAuthIndex,
+                                            'is-fast': item.wsConnected && item.index !== state.currentAuthIndex,
                                         }"
                                         :disabled="isBusy || item.index === state.currentAuthIndex"
                                         :title="
                                             item.index === state.currentAuthIndex
                                                 ? t('currentAccount')
-                                                : item.hasContext
+                                                : item.wsConnected
                                                   ? t('fastSwitch')
                                                   : t('btnSwitchAccount')
                                         "
@@ -1306,6 +1318,57 @@
                                 />
                             </div>
                             <div class="switch-container">
+                                <span class="label">
+                                    <span>
+                                        {{ t("routingPoolSize") }}
+                                        <EnvVarTooltip env-var="ROUTING_POOL_SIZE" doc-section="proxy-config" />
+                                    </span>
+                                </span>
+                                <el-input-number
+                                    v-model="state.routingPoolSize"
+                                    :min="0"
+                                    :max="state.maxContexts || 1000"
+                                    :step="1"
+                                    controls-position="right"
+                                    @change="handleRoutingPoolSizeChange"
+                                />
+                            </div>
+                            <div class="switch-container">
+                                <span class="label">
+                                    <span>
+                                        {{ t("warmStandbyContexts") }}
+                                        <EnvVarTooltip env-var="WARM_STANDBY_CONTEXTS" doc-section="proxy-config" />
+                                    </span>
+                                </span>
+                                <el-input-number
+                                    v-model="state.warmStandbyContexts"
+                                    :min="0"
+                                    :max="state.maxContexts || 1000"
+                                    :step="1"
+                                    controls-position="right"
+                                    @change="handleWarmStandbyContextsChange"
+                                />
+                            </div>
+                            <div class="switch-container">
+                                <span class="label"
+                                    ><span>{{ t("modelPoolMode") }}</span></span
+                                >
+                                <el-select v-model="state.modelPoolMode" @change="handleModelPoolModeChange">
+                                    <el-option :label="t('modelPoolModeAll')" value="all" />
+                                    <el-option :label="t('modelPoolModeAllowlist')" value="allowlist" />
+                                </el-select>
+                            </div>
+                            <div class="switch-container model-pool-allowlist-setting">
+                                <span class="label"
+                                    ><span>{{ t("modelPoolAllowlist") }}</span></span
+                                >
+                                <el-input
+                                    v-model="state.modelPoolAllowlistText"
+                                    :placeholder="t('modelPoolAllowlistPlaceholder')"
+                                    @change="handleModelPoolAllowlistChange"
+                                />
+                            </div>
+                            <div class="switch-container">
                                 <span class="label"
                                     ><span
                                         >{{ t("maxRetries")
@@ -1339,7 +1402,9 @@
                                 <span class="label"
                                     ><span
                                         >{{ t("autoHealProbeIntervalMinutes")
-                                        }}<EnvVarTooltip env-var="AUTOHEAL_PROBE_INTERVAL_MS" doc-section="proxy-config"
+                                        }}<EnvVarTooltip
+                                            env-var="AUTOHEAL_PROBE_INTERVAL_MS"
+                                            doc-section="proxy-config"
                                     /></span>
                                 </span>
                                 <el-input-number
@@ -2607,7 +2672,6 @@
                     </section>
                 </div>
 
-
                 <div class="full-width-section">
                     <section class="status-card records-card">
                         <div class="card-header-v2">
@@ -2931,9 +2995,8 @@ const t = (key, options) => {
 const statsState = reactive({
     accounts: [],
     records: [],
-    startedAt: null,
-    totalRecords: null,
     recordsTruncated: false,
+    startedAt: null,
     summary: {
         abortedCount: 0,
         activeRequests: 0,
@@ -2947,6 +3010,7 @@ const statsState = reactive({
         uniqueAccountPairs: 0,
         uptimeSeconds: 0,
     },
+    totalRecords: null,
 });
 
 // Time range filter: 'all' | '1h' | '6h' | '24h' | '7d' | '30d' | 'custom'
@@ -3385,7 +3449,6 @@ const filteredSummary = computed(() => {
     };
 });
 
-
 const translateLabel = value => {
     if (!value) return "-";
     if (value === EMPTY_FILTER_VALUE) return t("emptyValue");
@@ -3707,8 +3770,12 @@ const state = reactive({
     logScrollTop: 0,
     maxContexts: 1,
     maxRetries: 3,
+    modelPoolAllowlistText: "",
+    modelPoolMode: "all",
+    readyWebSocketCount: 0,
     releaseUrl: null,
     retryDelay: 2000,
+    routingPoolSize: 1,
     safetySettingsThreshold: "OFF",
     selectedAccounts: new Set(),
     serviceConnected: false,
@@ -3718,6 +3785,8 @@ const state = reactive({
     testingAccountIndex: -1,
     // theme: handled by useTheme
     usageCount: 0,
+    warmStandbyContexts: 0,
+    warmStandbyReadyWebSocketCount: 0,
 });
 
 const safetySettingsThresholdOptions = [
@@ -3749,16 +3818,24 @@ const browserConnectedText = computed(() => {
 // Total scanned accounts count
 const totalScannedCount = computed(() => state.accountDetails.length);
 
-// Deduped available accounts count (excluding duplicates and invalid)
+// Deduped available accounts count (excluding accounts routing cannot use)
 const dedupedAvailableCount = computed(() => {
-    return state.accountDetails.filter(acc => !acc.isDuplicate && !acc.isInvalid).length;
+    return state.accountDetails.filter(acc => !acc.isDuplicate && !acc.isInvalid && !acc.isDisabled && !acc.isExpired)
+        .length;
 });
 
-// Active contexts display (e.g., "1 / 3" or "1 / ∞")
+// Display the value the request router can actually use. A browser Context can
+// survive briefly while its in-page WebSocket reconnects, so show both counts
+// whenever they differ instead of presenting a Context as an online account.
 const activeContextsDisplay = computed(() => {
-    const active = state.activeContextsCount;
-    const max = state.maxContexts;
-    return max === 0 ? `${active} / ∞` : `${active} / ${max}`;
+    const ready = state.readyWebSocketCount;
+    const contexts = state.activeContextsCount;
+    const max = state.routingPoolSize;
+    const target = max === 0 ? "∞" : max;
+    const loginCap = state.maxContexts === 0 ? "∞" : state.maxContexts;
+    return ready === contexts
+        ? `${ready} READY / ${target} · Login:${loginCap}`
+        : `${ready} READY / ${target} · C:${contexts} · Login:${loginCap}`;
 });
 
 const isBusy = computed(() => state.isSwitchingAccount || state.isSystemBusy);
@@ -4235,6 +4312,40 @@ const handleNumericSettingChange = async (apiUrl, settingName, value) => {
 };
 
 const handleMaxContextsChange = value => handleNumericSettingChange("/api/settings/max-contexts", "maxContexts", value);
+const handleRoutingPoolSizeChange = value =>
+    handleNumericSettingChange("/api/settings/routing-pool-size", "routingPoolSize", value);
+const handleWarmStandbyContextsChange = value =>
+    handleNumericSettingChange("/api/settings/warm-standby-contexts", "warmStandbyContexts", value);
+const handleModelPoolModeChange = value => handleModelPoolSettingChange({ mode: value });
+const handleModelPoolAllowlistChange = value =>
+    handleModelPoolSettingChange({
+        allowlist: String(value || "")
+            .split(",")
+            .map(item => item.trim())
+            .filter(Boolean),
+    });
+const handleModelPoolSettingChange = async patch => {
+    try {
+        const res = await fetch("/api/settings/model-routing", {
+            body: JSON.stringify(patch),
+            headers: { "Content-Type": "application/json" },
+            method: "PUT",
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        if (data.modelPoolMode) state.modelPoolMode = data.modelPoolMode;
+        if (Array.isArray(data.modelPoolAllowlist)) {
+            state.modelPoolAllowlistText = data.modelPoolAllowlist.join(", ");
+        }
+        ElMessage.success(t("settingUpdateSuccess", { setting: t("modelPoolMode"), value: data.modelPoolMode || "" }));
+        await updateContent();
+        return true;
+    } catch (error) {
+        ElMessage.error(t("settingFailed", { message: error.message || error }));
+        await updateContent();
+        return false;
+    }
+};
 
 const handleMaxRetriesChange = value => handleNumericSettingChange("/api/settings/max-retries", "maxRetries", value);
 const handleRetryDelayChange = value => handleNumericSettingChange("/api/settings/retry-delay", "retryDelay", value);
@@ -4573,12 +4684,20 @@ const updateStatus = data => {
     state.currentAuthIndex = data.status.currentAuthIndex;
     state.accountDetails = data.status.accountDetails || [];
     state.activeContextsCount = data.status.activeContextsCount || 0;
+    state.readyWebSocketCount = data.status.readyWebSocketCount || 0;
     state.accountCooldownMaxMs = data.status.accountCooldownMaxMs ?? 1800000;
     state.accountCooldownMs = data.status.accountCooldownMs ?? 300000;
     state.autoDisableStatusCodes = data.status.autoDisableStatusCodes || [401, 403];
     state.autoHealProbeIntervalMinutes = Math.round((data.status.autoHealProbeIntervalMs ?? 18000000) / 60000);
     state.autoHealProbeTimeoutMinutes = Math.round((data.status.autoHealProbeTimeoutMs ?? 600000) / 60000);
     state.maxContexts = data.status.maxContexts ?? 1;
+    state.routingPoolSize = data.status.routingPoolSize ?? state.maxContexts;
+    state.warmStandbyContexts = data.status.warmStandbyContexts ?? 0;
+    state.warmStandbyReadyWebSocketCount = data.status.warmStandbyReadyWebSocketCount ?? 0;
+    state.modelPoolMode = data.status.modelPoolMode || data.status.modelRouting?.mode || "all";
+    state.modelPoolAllowlistText = (data.status.modelPoolAllowlist || data.status.modelRouting?.allowlist || []).join(
+        ", "
+    );
     state.maxRetries = data.status.maxRetries ?? 3;
     state.retryDelay = data.status.retryDelay ?? 2000;
     state.safetySettingsThreshold = data.status.safetySettingsThreshold || "OFF";
@@ -5129,8 +5248,7 @@ onMounted(() => {
     syncStatsFiltersViewport(statsFiltersMobileMediaQuery);
     statsFiltersMobileMediaQuery.addEventListener("change", syncStatsFiltersViewport);
 
-    updateContent().finally(scheduleUpdate);
-    fetchUsageStats().finally(scheduleUpdate);
+    Promise.all([updateContent(), fetchUsageStats()]).finally(scheduleUpdate);
 
     // Check for updates once on initial load
     checkForUpdates();

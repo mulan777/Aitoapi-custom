@@ -40,13 +40,31 @@ class ConfigLoader {
             host: "0.0.0.0",
             httpPort: 7860,
             immediateSwitchStatusCodes: [429, 503],
+            // maxContexts is the total managed/login context ceiling.  Keep the
+            // legacy name for backwards compatibility with MAX_CONTEXTS and
+            // existing runtime-settings.json files.
             maxContexts: 1,
+
             maxRetries: 3,
+
+            modelPoolAllowlist: [],
+
+            modelPoolMode: "all",
+
+            modelRouting: null,
+
             retryDelay: 2000,
+            // Capacity is split into a total/login cap, a routable READY
+            // WebSocket cap, and optional standby contexts.  Keep the READY
+            // cap unset until MAX_CONTEXTS/runtime settings have been applied
+            // so existing installations retain the legacy "all contexts are
+            // routable" behaviour.
+            routingPoolSize: null,
             safetySettingsThreshold: "OFF",
             streamingMode: "real",
             streamTimeoutMs: 60000,
             switchOnUses: 40,
+            warmStandbyContexts: 0,
             wsPort: 9998,
         };
 
@@ -100,6 +118,14 @@ class ConfigLoader {
             const parsed = parseInt(process.env.MAX_CONTEXTS, 10);
             config.maxContexts = Number.isFinite(parsed) ? Math.max(0, parsed) : config.maxContexts;
         }
+        if (process.env.ROUTING_POOL_SIZE) {
+            const parsed = parseInt(process.env.ROUTING_POOL_SIZE, 10);
+            config.routingPoolSize = Number.isFinite(parsed) ? Math.max(0, parsed) : config.routingPoolSize;
+        }
+        if (process.env.WARM_STANDBY_CONTEXTS) {
+            const parsed = parseInt(process.env.WARM_STANDBY_CONTEXTS, 10);
+            config.warmStandbyContexts = Number.isFinite(parsed) ? Math.max(0, parsed) : config.warmStandbyContexts;
+        }
         if (process.env.ACCOUNT_COOLDOWN_MS) {
             const parsed = parseInt(process.env.ACCOUNT_COOLDOWN_MS, 10);
             config.accountCooldownMs = Number.isFinite(parsed) ? Math.max(1000, parsed) : config.accountCooldownMs;
@@ -116,6 +142,16 @@ class ConfigLoader {
         // the runtime file is applied afterwards so a UI change survives a
         // process restart without rewriting .env or exposing credentials.
         this._applyRuntimeSettings(config);
+        // A missing split-pool value is intentionally backward compatible:
+        // every login Context remains eligible for routing until an operator
+        // explicitly chooses a smaller READY pool.
+        if (!Number.isInteger(config.routingPoolSize)) config.routingPoolSize = config.maxContexts;
+        if (config.maxContexts > 0 && config.routingPoolSize > config.maxContexts) {
+            config.routingPoolSize = config.maxContexts;
+        }
+        if (config.maxContexts > 0 && config.warmStandbyContexts > config.maxContexts) {
+            config.warmStandbyContexts = config.maxContexts;
+        }
         if (process.env.CAMOUFOX_EXECUTABLE_PATH) config.browserExecutablePath = process.env.CAMOUFOX_EXECUTABLE_PATH;
         if (process.env.API_KEYS) {
             config.apiKeys = process.env.API_KEYS.split(",");
@@ -149,6 +185,13 @@ class ConfigLoader {
             config.enableAuthUpdate = process.env.ENABLE_AUTH_UPDATE.toLowerCase() !== "false";
         if (process.env.ENABLE_USAGE_STATS)
             config.enableUsageStats = process.env.ENABLE_USAGE_STATS.toLowerCase() !== "false";
+        if (process.env.MODEL_POOL_MODE) {
+            const mode = String(process.env.MODEL_POOL_MODE).trim().toLowerCase();
+            if (mode === "all" || mode === "allowlist") config.modelPoolMode = mode;
+        }
+        if (process.env.MODEL_POOL_ALLOWLIST !== undefined) {
+            config.modelPoolAllowlist = this._parseModelPoolAllowlist(process.env.MODEL_POOL_ALLOWLIST);
+        }
 
         let rawCodes = process.env.IMMEDIATE_SWITCH_STATUS_CODES;
         let codesSource = "environment variable";
@@ -223,10 +266,22 @@ class ConfigLoader {
             ...new Set(
                 values
                     .map(item => Number.parseInt(String(item).trim(), 10))
-                    .filter(code => Number.isInteger(code) && code >= 400 && code <= 599)
+                    .filter(code => Number.isInteger(code) && code >= 400 && code <= 599 && code !== 503)
             ),
         ];
         return parsed.length > 0 ? parsed : [...fallback];
+    }
+
+    _parseModelPoolAllowlist(value) {
+        const values = Array.isArray(value) ? value : String(value || "").split(",");
+        return [
+            ...new Set(
+                values
+                    .map(item => String(item || "").trim())
+                    .filter(Boolean)
+                    .slice(0, 100)
+            ),
+        ];
     }
 
     _applyRuntimeSettings(config) {
@@ -240,6 +295,30 @@ class ConfigLoader {
             const isIntegerInRange = (value, min, max) => Number.isInteger(value) && value >= min && value <= max;
 
             if (isIntegerInRange(raw.maxContexts, 0, 1000)) config.maxContexts = raw.maxContexts;
+            // Files written by older versions do not have routingPoolSize;
+            // inherit the legacy total-context setting in that case.
+            if (!Object.prototype.hasOwnProperty.call(raw, "routingPoolSize")) {
+                config.routingPoolSize = config.maxContexts;
+            }
+            if (isIntegerInRange(raw.routingPoolSize, 0, 1000)) config.routingPoolSize = raw.routingPoolSize;
+            if (isIntegerInRange(raw.warmStandbyContexts, 0, 1000)) {
+                config.warmStandbyContexts = raw.warmStandbyContexts;
+            }
+            if (raw.modelPoolMode === "all" || raw.modelPoolMode === "allowlist") {
+                config.modelPoolMode = raw.modelPoolMode;
+            }
+            if (Array.isArray(raw.modelPoolAllowlist)) {
+                config.modelPoolAllowlist = this._parseModelPoolAllowlist(raw.modelPoolAllowlist);
+            }
+            if (raw.modelRouting && typeof raw.modelRouting === "object") {
+                config.modelRouting = raw.modelRouting;
+                if (raw.modelRouting.mode === "all" || raw.modelRouting.mode === "allowlist") {
+                    config.modelPoolMode = raw.modelRouting.mode;
+                }
+                if (Array.isArray(raw.modelRouting.allowlist)) {
+                    config.modelPoolAllowlist = this._parseModelPoolAllowlist(raw.modelRouting.allowlist);
+                }
+            }
             if (isIntegerInRange(raw.maxRetries, 1, 20)) config.maxRetries = raw.maxRetries;
             if (isIntegerInRange(raw.retryDelay, 50, 600000)) config.retryDelay = raw.retryDelay;
             if (Array.isArray(raw.autoDisableStatusCodes)) {
@@ -253,6 +332,12 @@ class ConfigLoader {
             }
             if (config.accountCooldownMaxMs < config.accountCooldownMs) {
                 config.accountCooldownMaxMs = config.accountCooldownMs;
+            }
+            if (config.maxContexts > 0 && config.routingPoolSize !== null) {
+                config.routingPoolSize = Math.min(config.routingPoolSize, config.maxContexts);
+            }
+            if (config.maxContexts > 0) {
+                config.warmStandbyContexts = Math.min(config.warmStandbyContexts, config.maxContexts);
             }
             // AutoHeal probe schedule (v1.2.6): interval + per-account probe timeout.
             if (isIntegerInRange(raw.autoHealProbeIntervalMs, 60000, 604800000)) {
@@ -282,7 +367,14 @@ class ConfigLoader {
         this.logger.info(`  Default Safety Threshold: ${config.safetySettingsThreshold}`);
         this.logger.info(`  Auto Update Auth: ${config.enableAuthUpdate}`);
         this.logger.info(`  Usage Stats: ${config.enableUsageStats}`);
-        this.logger.info(`  Max Contexts: ${config.maxContexts === 0 ? "Unlimited" : config.maxContexts}`);
+        this.logger.info(
+            `  Max Contexts (login/managed): ${config.maxContexts === 0 ? "Unlimited" : config.maxContexts}`
+        );
+        this.logger.info(`  READY Routing Pool: ${config.routingPoolSize === 0 ? "All" : config.routingPoolSize}`);
+        this.logger.info(`  Warm Standby Contexts: ${config.warmStandbyContexts}`);
+        this.logger.info(
+            `  Model Pool: ${config.modelPoolMode}${config.modelPoolAllowlist.length ? ` (${config.modelPoolAllowlist.join(", ")})` : ""}`
+        );
         this.logger.info(
             `  Account 429 Cooldown: ${Math.round(config.accountCooldownMs / 1000)}s (max ${Math.round(config.accountCooldownMaxMs / 1000)}s)`
         );

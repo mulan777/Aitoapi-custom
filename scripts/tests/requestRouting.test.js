@@ -32,6 +32,9 @@ const makeHandler = () => {
         getAllConnections: () => connections,
         getConnectionByAuth: authIndex => connections.get(authIndex),
     };
+    handler.browserManager = {
+        contexts: new Map([0, 1].map(index => [index, { page: { isClosed: () => false } }])),
+    };
     handler.logger = { debug() {}, info() {}, warn() {} };
     handler.requestAuthBindings = new Map();
     handler.requestModelBindings = new Map();
@@ -293,7 +296,13 @@ const testAccountTestPreservesActiveCooldown = async () => {
 
 const testReadyCheckMovesQueuedRequestOffCooldownAccount = async () => {
     const { handler } = makeHandler();
-    handler.browserManager = { notifyUserActivity() {} };
+    handler.browserManager = {
+        contexts: new Map([
+            [0, { page: { isClosed: () => false } }],
+            [1, { page: { isClosed: () => false } }],
+        ]),
+        notifyUserActivity() {},
+    };
     handler._markTrackedEarlyExitIfNeeded = () => {};
     handler._sendErrorResponse = () => {
         throw new Error("unexpected error response");
@@ -352,14 +361,14 @@ const testPerAccountUsageRotation = async () => {
             connections.delete(authIndex);
         },
         contexts: new Map([
-            [0, {}],
-            [1, {}],
-            [2, {}],
-            [3, {}],
-            [4, {}],
+            [0, { page: { isClosed: () => false } }],
+            [1, { page: { isClosed: () => false } }],
+            [2, { page: { isClosed: () => false } }],
+            [3, { page: { isClosed: () => false } }],
+            [4, { page: { isClosed: () => false } }],
         ]),
         async ensureContextForAuth(authIndex) {
-            this.contexts.set(authIndex, {});
+            this.contexts.set(authIndex, { page: { isClosed: () => false } });
             connections.set(authIndex, { readyState: 1, send() {} });
             return true;
         },
@@ -395,7 +404,9 @@ const testUsageThresholdFallsBackToHealthySingleAccount = async () => {
         getRotationIndices: () => [0],
         isUnavailable: () => false,
     };
-    handler.browserManager = { contexts: new Map([[0, {}]]) };
+    handler.browserManager = { contexts: new Map([[0, { page: { isClosed: () => false } }]]) };
+
+    handler.connectionRegistry.getConnectionByAuth = authIndex => connections.get(authIndex);
     handler._bindRequestAuthIndex("single-account", 0);
     handler._incrementGenerationUsage("single-account", 0, "test generation");
     handler._releaseRequestAuthIndex("single-account");

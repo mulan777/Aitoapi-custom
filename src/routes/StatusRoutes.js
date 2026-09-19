@@ -54,7 +54,12 @@ class StatusRoutes {
             autoHealProbeTimeoutMs: this.config.autoHealProbeTimeoutMs,
             maxContexts: this.config.maxContexts,
             maxRetries: this.config.maxRetries,
+            modelPoolAllowlist: this.config.modelPoolAllowlist,
+            modelPoolMode: this.config.modelPoolMode,
+            modelRouting: this.config.modelRouting || null,
             retryDelay: this.config.retryDelay,
+            routingPoolSize: this.config.routingPoolSize,
+            warmStandbyContexts: this.config.warmStandbyContexts,
         };
         const directory = path.dirname(this.runtimeSettingsPath);
         await fs.promises.mkdir(directory, { recursive: true });
@@ -949,6 +954,34 @@ class StatusRoutes {
             if (setting === "accountCooldownMs" && value > this.config.accountCooldownMaxMs) {
                 this.config.accountCooldownMaxMs = value;
             }
+            if (setting === "maxContexts" && value > 0) {
+                const routingPoolSize = Number(this.config.routingPoolSize ?? value);
+                const warmStandbyContexts = Number(this.config.warmStandbyContexts || 0);
+                if (routingPoolSize > value || routingPoolSize + warmStandbyContexts > value) {
+                    return res.status(400).json({
+                        error: "Total login Contexts must cover the READY routing pool and warm standby contexts.",
+                        message: "settingFailed",
+                    });
+                }
+            }
+            if (setting === "routingPoolSize" && this.config.maxContexts > 0) {
+                const warmStandbyContexts = Number(this.config.warmStandbyContexts || 0);
+                if (value > this.config.maxContexts || value + warmStandbyContexts > this.config.maxContexts) {
+                    return res.status(400).json({
+                        error: "READY routing pool plus warm standby contexts cannot exceed total login Contexts.",
+                        message: "settingFailed",
+                    });
+                }
+            }
+            if (setting === "warmStandbyContexts" && this.config.maxContexts > 0) {
+                const routingPoolSize = Number(this.config.routingPoolSize ?? this.config.maxContexts);
+                if (value + routingPoolSize > this.config.maxContexts) {
+                    return res.status(400).json({
+                        error: "Warm standby contexts plus READY routing pool cannot exceed total login Contexts.",
+                        message: "settingFailed",
+                    });
+                }
+            }
             this.config[setting] = value;
             try {
                 await this._saveRuntimeSettings();
@@ -957,7 +990,7 @@ class StatusRoutes {
                 return res.status(500).json({ error: "Failed to persist setting.", message: "settingFailed" });
             }
             this.logger.info(`[WebUI] Numeric setting ${setting} updated to ${value}`);
-            if (setting === "maxContexts") {
+            if (setting === "maxContexts" || setting === "routingPoolSize" || setting === "warmStandbyContexts") {
                 this.serverSystem.browserManager.rebalanceContextPool().catch(error => {
                     this.logger.error(`[WebUI] Context pool rebalance failed: ${error.message}`);
                 });
@@ -981,7 +1014,7 @@ class StatusRoutes {
                 ...new Set(
                     rawCodes
                         .map(value => Number.parseInt(String(value).trim(), 10))
-                        .filter(value => Number.isInteger(value) && value >= 400 && value <= 599)
+                        .filter(value => Number.isInteger(value) && value >= 400 && value <= 599 && value !== 503)
                 ),
             ];
             this.config.autoDisableStatusCodes = codes;
@@ -996,8 +1029,84 @@ class StatusRoutes {
             }
         });
 
+        // Model pool partitioning is runtime-adjustable.  The lightweight
+        // aliases (mode/allowlist) are kept alongside the richer
+        // modelRouting object used by deployments that define named groups.
+        app.put("/api/settings/model-routing", isAuthenticated, async (req, res) => {
+            const body = req.body && typeof req.body === "object" ? req.body : {};
+            const mode = body.mode ?? body.modelPoolMode;
+            const allowlist = body.allowlist ?? body.modelPoolAllowlist;
+            if (mode !== undefined && mode !== "all" && mode !== "allowlist") {
+                return res.status(400).json({ error: "mode must be all or allowlist", message: "settingFailed" });
+            }
+            if (allowlist !== undefined && !Array.isArray(allowlist) && typeof allowlist !== "string") {
+                return res
+                    .status(400)
+                    .json({ error: "allowlist must be an array or comma-separated string", message: "settingFailed" });
+            }
+            const parseAllowlist = value => [
+                ...new Set(
+                    (Array.isArray(value) ? value : String(value || "").split(","))
+                        .map(item => String(item || "").trim())
+                        .filter(Boolean)
+                        .slice(0, 100)
+                ),
+            ];
+            const nextAllowlist =
+                allowlist === undefined ? this.config.modelPoolAllowlist || [] : parseAllowlist(allowlist);
+            this.config.modelPoolMode = mode || this.config.modelPoolMode || "all";
+            this.config.modelPoolAllowlist = nextAllowlist;
+            const previous =
+                this.config.modelRouting && typeof this.config.modelRouting === "object"
+                    ? this.config.modelRouting
+                    : {};
+            const resetNamedGroups =
+                this.config.modelPoolMode === "all" &&
+                body.groups === undefined &&
+                body.enabled === undefined &&
+                body.strict === undefined;
+            const compactAllowlistMode =
+                this.config.modelPoolMode === "allowlist" &&
+                body.groups === undefined &&
+                body.enabled === undefined &&
+                body.strict === undefined;
+            this.config.modelRouting = {
+                ...previous,
+                ...(resetNamedGroups ? { defaultGroupId: null, enabled: false, groups: [], strict: false } : {}),
+                ...(compactAllowlistMode ? { enabled: true, groups: [], strict: true } : {}),
+                ...(body.enabled === undefined ? {} : { enabled: Boolean(body.enabled) }),
+                ...(body.strict === undefined ? {} : { strict: Boolean(body.strict) }),
+                ...(body.defaultGroupId === undefined ? {} : { defaultGroupId: body.defaultGroupId || null }),
+                ...(body.groups === undefined ? {} : { groups: Array.isArray(body.groups) ? body.groups : [] }),
+                allowlist: nextAllowlist,
+                mode: this.config.modelPoolMode,
+            };
+            try {
+                await this._saveRuntimeSettings();
+                this.logger.info(
+                    `[WebUI] Model routing updated: mode=${this.config.modelPoolMode}, allowlist=${nextAllowlist.join(", ")}`
+                );
+                return res.status(200).json({
+                    message: "settingUpdateSuccess",
+                    modelPoolAllowlist: nextAllowlist,
+                    modelPoolMode: this.config.modelPoolMode,
+                    modelRouting: this.config.modelRouting,
+                    setting: "modelRouting",
+                    value: this.config.modelPoolMode,
+                });
+            } catch (error) {
+                return res.status(500).json({ error: error.message, message: "settingFailed" });
+            }
+        });
+
         app.put("/api/settings/max-contexts", isAuthenticated, (req, res) =>
             updateNumericSetting(req, res, "maxContexts", { max: 1000, min: 0 })
+        );
+        app.put("/api/settings/routing-pool-size", isAuthenticated, (req, res) =>
+            updateNumericSetting(req, res, "routingPoolSize", { max: 1000, min: 0 })
+        );
+        app.put("/api/settings/warm-standby-contexts", isAuthenticated, (req, res) =>
+            updateNumericSetting(req, res, "warmStandbyContexts", { max: 1000, min: 0 })
         );
         app.put("/api/settings/account-cooldown-ms", isAuthenticated, (req, res) =>
             updateNumericSetting(req, res, "accountCooldownMs", { max: 86400000, min: 1000 })
@@ -1012,10 +1121,14 @@ class StatusRoutes {
             const intervalMs = Number(req.body?.probeIntervalMs);
             const timeoutMs = Number(req.body?.probeTimeoutMs);
             if (!Number.isInteger(intervalMs) || intervalMs < 60000 || intervalMs > 604800000) {
-                return res.status(400).json({ error: "probeIntervalMs must be 60000..604800000", message: "settingFailed" });
+                return res
+                    .status(400)
+                    .json({ error: "probeIntervalMs must be 60000..604800000", message: "settingFailed" });
             }
             if (!Number.isInteger(timeoutMs) || timeoutMs < 30000 || timeoutMs > 3600000) {
-                return res.status(400).json({ error: "probeTimeoutMs must be 30000..3600000", message: "settingFailed" });
+                return res
+                    .status(400)
+                    .json({ error: "probeTimeoutMs must be 30000..3600000", message: "settingFailed" });
             }
             this.config.autoHealProbeIntervalMs = intervalMs;
             this.config.autoHealProbeTimeoutMs = timeoutMs;
@@ -1186,7 +1299,7 @@ class StatusRoutes {
     }
 
     _getStatusData() {
-        const { config, requestHandler, authSource, browserManager } = this.serverSystem;
+        const { config, requestHandler, authSource, browserManager, connectionRegistry } = this.serverSystem;
         const initialIndices = authSource.initialIndices || [];
         const invalidIndices = initialIndices.filter(i => !authSource.availableIndices.includes(i));
         const rotationIndices = authSource.getRotationIndices();
@@ -1198,6 +1311,23 @@ class StatusRoutes {
         const allLogs = this.logger.logBuffer || [];
         const displayLogs = allLogs.slice(-limit);
         const accountNameMap = authSource.accountNameMap;
+        const isContextLive = index => {
+            const contextData = browserManager.contexts.get(index);
+            return Boolean(
+                contextData?.page && typeof contextData.page.isClosed === "function" && !contextData.page.isClosed()
+            );
+        };
+        const isContextSchedulable = index => {
+            if (typeof browserManager._isContextSchedulable === "function") {
+                return browserManager._isContextSchedulable(index);
+            }
+            return authSource.isUnavailable?.(index) !== true;
+        };
+        const isManagedReadyContext = index => {
+            if (!isContextLive(index) || !isContextSchedulable(index)) return false;
+            const connection = connectionRegistry.getConnectionByAuth(index, false);
+            return Boolean(connection && connection.readyState === 1);
+        };
         const accountDetails = initialIndices.map(index => {
             const isInvalid = invalidIndices.includes(index);
             const name = isInvalid ? null : accountNameMap.get(index) || null;
@@ -1210,6 +1340,8 @@ class StatusRoutes {
             const authMetadata = isInvalid ? null : authSource.getStatusMetadata(index);
 
             const hasContext = browserManager.contexts.has(index);
+            const connection = connectionRegistry.getConnectionByAuth(index, false);
+            const wsConnected = isManagedReadyContext(index);
             const route = requestHandler.getAccountRouteStatus(index);
 
             return {
@@ -1224,6 +1356,7 @@ class StatusRoutes {
                 isExpired,
                 isInvalid,
                 isRotation,
+                modelGroups: typeof authSource.getModelGroups === "function" ? authSource.getModelGroups(index) : [],
                 name,
                 route,
                 todayStats: todayStats[String(index)] || {
@@ -1232,6 +1365,8 @@ class StatusRoutes {
                     successCount: 0,
                     totalCount: 0,
                 },
+                wsConnected,
+                wsReadyState: connection ? connection.readyState : null,
             };
         });
 
@@ -1248,6 +1383,26 @@ class StatusRoutes {
                 ? `${requestHandler.failureCount} / ${config.failureThreshold}`
                 : requestHandler.failureCount;
 
+        const registryReadyWebSocketCount = [...connectionRegistry.getAllConnections().values()].filter(
+            connection => connection && connection.readyState === 1
+        ).length;
+        const managedReadyWebSocketCount = [...browserManager.contexts.keys()].filter(index =>
+            isManagedReadyContext(index)
+        ).length;
+        const maxContexts = Number(config.maxContexts) || 0;
+        const routingPoolSize = Number.isInteger(config.routingPoolSize) ? config.routingPoolSize : maxContexts;
+        const orderedReadyIndices =
+            typeof browserManager.getOrderedReadyAuthIndices === "function"
+                ? browserManager.getOrderedReadyAuthIndices()
+                : [...browserManager.contexts.keys()].filter(isManagedReadyContext);
+        const routingReadyIndices =
+            routingPoolSize > 0 ? orderedReadyIndices.slice(0, routingPoolSize) : orderedReadyIndices;
+        const routingReadySet = new Set(routingReadyIndices);
+        const routingReadyWebSocketCount = routingReadyIndices.length;
+        const warmStandbyReadyWebSocketCount = orderedReadyIndices.filter(index => !routingReadySet.has(index)).length;
+        const readyWebSocketCount = routingReadyWebSocketCount;
+        const currentConnection = connectionRegistry.getConnectionByAuth(currentAuthIndex, false);
+
         return {
             logCount: displayLogs.length,
             logs: displayLogs.join("\n"),
@@ -1256,12 +1411,12 @@ class StatusRoutes {
                 accountCooldownMs: config.accountCooldownMs,
                 accountDetails,
                 activeContextsCount: browserManager.contexts.size,
-
                 apiKeySource: config.apiKeySource,
+
                 autoDisableStatusCodes: config.autoDisableStatusCodes,
                 autoHealProbeIntervalMs: config.autoHealProbeIntervalMs,
                 autoHealProbeTimeoutMs: config.autoHealProbeTimeoutMs,
-                browserConnected: !!this.serverSystem.connectionRegistry.getConnectionByAuth(currentAuthIndex, false),
+                browserConnected: Boolean(currentConnection && currentConnection.readyState === 1),
                 checkUpdate: config.checkUpdate,
                 currentAccountName,
                 currentAuthIndex,
@@ -1283,13 +1438,26 @@ class StatusRoutes {
                 invalidIndicesRaw: invalidIndices,
                 isSystemBusy: requestHandler.isSystemBusy,
                 logMaxCount: limit,
+                managedReadyWebSocketCount,
                 maxContexts: config.maxContexts,
                 maxRetries: config.maxRetries,
+                modelPoolAllowlist: config.modelPoolAllowlist || [],
+                modelPoolMode: config.modelPoolMode || "all",
+                modelRouting:
+                    typeof requestHandler.getModelRoutingStatus === "function"
+                        ? requestHandler.getModelRoutingStatus()
+                        : config.modelRouting || null,
+                readyWebSocketCount,
+                registryReadyWebSocketCount,
                 retryDelay: config.retryDelay,
                 rotationIndicesRaw: rotationIndices,
+                routingPoolSize,
+                routingReadyWebSocketCount,
                 safetySettingsThreshold: config.safetySettingsThreshold,
                 streamingMode: config.streamingMode,
                 usageCount,
+                warmStandbyContexts: config.warmStandbyContexts || 0,
+                warmStandbyReadyWebSocketCount,
             },
         };
     }

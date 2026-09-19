@@ -68,5 +68,9 @@ camoufox*
 
 # Auth setup scripts (not needed in Linux container)
 scripts/auth
+# Local deployment helpers can contain host credentials and are not application
+# runtime assets. Keep every build/deploy helper out of production images.
+scripts/build-*.sh
+scripts/deploy-*.sh
 proxylist.txt
 proxy_mapping.json

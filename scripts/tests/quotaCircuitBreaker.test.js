@@ -183,10 +183,12 @@ async function main() {
         // ---- 4. probe skips in-window accounts; over-probed accounts are STILL probed ----
         await mockAuthSource.disableAuth(73, { reason: "quota_exhausted", status: 429 });
         rh._getAccountRouteState(73).quotaDisabledUntil = Date.now() + 1200000; // in-window
+        rh._getAccountRouteState(73).autoHealNextProbeAt = rh._getAccountRouteState(73).quotaDisabledUntil;
         rh._getAccountRouteState(73).quotaProbeEpisodes = 0;
 
         await mockAuthSource.disableAuth(74, { reason: "quota_exhausted", status: 429 });
         rh._getAccountRouteState(74).quotaDisabledUntil = 0; // window elapsed
+        rh._getAccountRouteState(74).autoHealNextProbeAt = Date.now() - 1;
         rh._getAccountRouteState(74).quotaProbeEpisodes = 3; // past the old max — still probed (never give up)
 
         const enablesBefore = mockAuthSource.enableCalls;
@@ -201,6 +203,7 @@ async function main() {
         // ---- 5. healthy account is restored once the window elapsed ----
         await mockAuthSource.disableAuth(69, { reason: "quota_exhausted", status: 429 });
         rh._getAccountRouteState(69).quotaDisabledUntil = 0;
+        rh._getAccountRouteState(69).autoHealNextProbeAt = Date.now() - 1;
         rh._getAccountRouteState(69).quotaProbeEpisodes = 0;
 
         await rh._runAutoHealProbe();
@@ -217,6 +220,7 @@ async function main() {
         // ---- 6. failed isolated probe keeps the account disabled and costs one episode ----
         await mockAuthSource.disableAuth(68, { reason: "quota_exhausted", status: 429 });
         rh._getAccountRouteState(68).quotaDisabledUntil = 0;
+        rh._getAccountRouteState(68).autoHealNextProbeAt = Date.now() - 1;
         rh._getAccountRouteState(68).quotaProbeEpisodes = 0;
 
         const result = await rh._probeAndRestoreAccount(68, "quota_exhausted");

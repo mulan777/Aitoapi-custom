@@ -119,6 +119,15 @@ class ConnectionRegistry extends EventEmitter {
 
         // Remove from connectionsByAuth if it has an authIndex
         if (disconnectedAuthIndex !== undefined && disconnectedAuthIndex >= 0) {
+            const registeredConnection = this.connectionsByAuth.get(disconnectedAuthIndex);
+            if (registeredConnection !== websocket) {
+                this.logger.debug(
+                    `[Server] Ignoring disconnect from superseded WebSocket for authIndex=${disconnectedAuthIndex}; ` +
+                        "a newer connection is already registered or the connection was closed explicitly."
+                );
+                this.emit("connectionRemoved", websocket);
+                return;
+            }
             this.connectionsByAuth.delete(disconnectedAuthIndex);
             this.logger.info(`[Server] Internal WebSocket client disconnected (authIndex: ${disconnectedAuthIndex}).`);
         } else {
@@ -307,6 +316,28 @@ class ConnectionRegistry extends EventEmitter {
         return currentAuthIndex >= 0 && this.reconnectGraceTimers.has(currentAuthIndex);
     }
 
+    /**
+     * Return whether an account still owns a live browser context whose
+     * WebSocket is expected to come back.
+     *
+     * A disconnect is intentionally represented by three independent pieces
+     * of state: the grace-period timer, the single-flight reconnect flag, and
+     * the timeout handle for the lightweight reconnect callback. Treating
+     * any of them as pending keeps the context's pool slot reserved across
+     * the small hand-off windows between those states.
+     *
+     * @param {number} authIndex - Account index to inspect
+     * @returns {boolean} true while grace/reconnect recovery is pending
+     */
+    isReconnectPending(authIndex) {
+        if (!Number.isInteger(authIndex) || authIndex < 0) return false;
+        return (
+            this.reconnectGraceTimers.has(authIndex) ||
+            this.reconnectingAccounts.get(authIndex) === true ||
+            this.lightweightReconnectTimeouts.has(authIndex)
+        );
+    }
+
     getConnectionByAuth(authIndex, log = true) {
         const connection = this.connectionsByAuth.get(authIndex);
 
@@ -371,9 +402,16 @@ class ConnectionRegistry extends EventEmitter {
      * If you call this method first, _removeConnection() may trigger unnecessary reconnect attempts.
      *
      * @param {number} authIndex - The auth index to close connection for
+     * @param {WebSocket} [expectedConnection] - Optional identity guard; skip if a newer socket is registered
      */
-    closeConnectionByAuth(authIndex) {
+    closeConnectionByAuth(authIndex, expectedConnection = null) {
         const connection = this.connectionsByAuth.get(authIndex);
+        if (expectedConnection && connection !== expectedConnection) {
+            this.logger.debug(
+                `[Registry] Skipping close for authIndex=${authIndex}; the registered WebSocket has already changed.`
+            );
+            return;
+        }
         if (connection) {
             this.logger.info(`[Registry] Closing WebSocket connection for authIndex=${authIndex}`);
             try {
@@ -382,7 +420,9 @@ class ConnectionRegistry extends EventEmitter {
                 this.logger.warn(`[Registry] Error closing WebSocket for authIndex=${authIndex}: ${e.message}`);
             }
             // Remove from map immediately (the close event will also trigger _removeConnection)
-            this.connectionsByAuth.delete(authIndex);
+            if (this.connectionsByAuth.get(authIndex) === connection) {
+                this.connectionsByAuth.delete(authIndex);
+            }
 
             // Clear any grace timers for this account
             if (this.reconnectGraceTimers.has(authIndex)) {

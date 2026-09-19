@@ -91,8 +91,39 @@ class ProxyServerSystem extends EventEmitter {
                     const success = await this.browserManager.attemptLightweightReconnect(authIndex);
                     if (!success) {
                         this.logger.warn(
-                            `[System] Lightweight reconnect failed for account #${authIndex}. Will attempt full recovery on next request.`
+                            `[System] Lightweight reconnect failed for account #${authIndex}. Recycling the stale Context and refilling the READY pool.`
                         );
+                        try {
+                            // A Context without an OPEN in-page WebSocket must
+                            // not keep occupying one of the MAX_CONTEXTS slots.
+                            // If it was the legacy current account, move that
+                            // pointer to an already READY standby first so the
+                            // repair does not leave the panel/service detached.
+                            if (isCurrentAccount) {
+                                const readyFallback = [...this.connectionRegistry.getAllConnections().entries()]
+                                    .filter(
+                                        ([candidateIndex, connection]) =>
+                                            candidateIndex !== authIndex && connection && connection.readyState === 1
+                                    )
+                                    .map(([candidateIndex]) => candidateIndex)
+                                    .sort((a, b) => a - b)[0];
+                                if (!Number.isInteger(readyFallback)) {
+                                    this.logger.warn(
+                                        `[System] No READY standby exists for failed current account #${authIndex}; deferring full recycle to request recovery.`
+                                    );
+                                    return;
+                                }
+                                await this.browserManager.launchOrSwitchContext(readyFallback);
+                            }
+
+                            await this.browserManager.closeContext(authIndex);
+                            this.connectionRegistry.closeConnectionByAuth(authIndex);
+                            await this.browserManager.rebalanceContextPool();
+                        } catch (repairError) {
+                            this.logger.error(
+                                `[System] READY-pool repair failed for account #${authIndex}: ${repairError.message}`
+                            );
+                        }
                     }
                 } else {
                     this.logger.info("[System] Browser not available, skipping lightweight reconnect.");
@@ -114,6 +145,9 @@ class ProxyServerSystem extends EventEmitter {
             this.authSource
         );
         this.browserManager.setSystemBusyProvider(() => this.requestHandler?.isSystemBusy === true);
+        this.browserManager.setContextSchedulableProvider(authIndex =>
+            this.requestHandler?.isAccountSchedulableForContextPool(authIndex)
+        );
 
         this.httpServer = null;
         this.wsServer = null;
@@ -178,11 +212,16 @@ class ProxyServerSystem extends EventEmitter {
 
         // Context pool startup
         const maxContexts = this.config.maxContexts;
-        this.logger.info(`[System] Starting context pool (maxContexts=${maxContexts})...`);
+        const desiredPoolSize = this.browserManager.getDesiredPoolSize?.() ?? maxContexts;
+        this.logger.info(
+            `[System] Starting context pool (maxContexts=${maxContexts}, desiredWarmPool=${
+                desiredPoolSize === 0 ? "unlimited" : desiredPoolSize
+            })...`
+        );
 
         try {
             this.requestHandler.authSwitcher.isSystemBusy = true;
-            const { firstReady } = await this.browserManager.preloadContextPool(startupOrder, maxContexts);
+            const { firstReady } = await this.browserManager.preloadContextPool(startupOrder, desiredPoolSize);
 
             if (firstReady === null) {
                 this.logger.error("[System] Failed to initialize any context!");
@@ -474,7 +513,14 @@ class ProxyServerSystem extends EventEmitter {
         // Keep the suffix variants visible in model discovery.  Request
         // conversion already supports these names; without this expansion
         // clients lose the selectable `-high-fake-search` style entries.
-        const discoverableModels = FormatConverter.expandModelListWithSuffixes(this.config.modelList);
+        const allDiscoverableModels = FormatConverter.expandModelListWithSuffixes(this.config.modelList);
+        // In strict model-pool mode keep discovery consistent with request
+        // routing: clients only see models this server is prepared to serve.
+        const discoverableModels = allDiscoverableModels.filter(model => {
+            const policy = this.requestHandler?.getModelRoutingStatus?.();
+            if (!policy?.strict) return true;
+            return this.requestHandler?._getModelRoutingDecision?.(model.name)?.allowed !== false;
+        });
 
         app.get(["/v1/models"], (req, res) => {
             // OpenAI format
@@ -629,6 +675,10 @@ class ProxyServerSystem extends EventEmitter {
      */
     async shutdown() {
         this.logger.info("[System] Shutting down server system...");
+
+        // Prevent an AutoHeal timeout from launching a throwaway browser while
+        // the production browser and servers are being torn down.
+        this.requestHandler?.stopAutoHealProbe?.();
 
         // Clear stale queue cleanup interval
         if (this.staleQueueCleanupInterval) {

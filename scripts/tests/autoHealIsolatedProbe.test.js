@@ -118,7 +118,8 @@ async function main() {
     await rh.recordWsDisconnect(68);
     await rh.recordWsDisconnect(68);
     const state68 = rh._getAccountRouteState(68);
-    assert.strictEqual(state68.wsDropCount, before + 3, "drops must accumulate");
+    assert.strictEqual(state68.wsDropCount, 0, "a completed threshold window must reset its drop counter");
+    assert.strictEqual(state68.crashLoopEpisodes, 1, "3 drops must count as one crash-loop episode");
     assert.ok(
         state68.wsCrashLoopUntil > Date.now(),
         "3 drops must arm the crash-loop quarantine (recovery will reroute)"

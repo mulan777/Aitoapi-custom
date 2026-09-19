@@ -76,6 +76,7 @@ class BrowserManager {
         this.connectionRegistry = null;
         this._onAuthQueuesDrained = null;
         this._isSystemBusyProvider = null;
+        this._contextSchedulableProvider = null;
         this.pendingContextClosures = new Map();
 
         // Background wakeup service status is tracked per auth context. The old
@@ -190,6 +191,10 @@ class BrowserManager {
         this._isSystemBusyProvider = typeof provider === "function" ? provider : null;
     }
 
+    setContextSchedulableProvider(provider) {
+        this._contextSchedulableProvider = typeof provider === "function" ? provider : null;
+    }
+
     _isSystemBusy() {
         try {
             return this._isSystemBusyProvider?.() === true;
@@ -197,6 +202,137 @@ class BrowserManager {
             this.logger.warn(`[ContextPool] Failed to read system busy state: ${error.message}`);
             return false;
         }
+    }
+
+    _isContextSchedulable(authIndex) {
+        if (!Number.isInteger(authIndex) || authIndex < 0) return false;
+        if (this.authSource?.isUnavailable?.(authIndex)) return false;
+        try {
+            return this._contextSchedulableProvider?.(authIndex) !== false;
+        } catch (error) {
+            this.logger.warn(
+                `[ContextPool] Failed to read schedulable state for account #${authIndex}: ${error.message}`
+            );
+            return false;
+        }
+    }
+
+    _isContextReady(authIndex) {
+        const contextData = this.contexts.get(authIndex);
+        if (!contextData?.page || contextData.page.isClosed()) return false;
+        const connection = this.connectionRegistry?.getConnectionByAuth?.(authIndex, false);
+        return Boolean(connection && connection.readyState === 1);
+    }
+
+    /**
+     * Pool capacity helpers.  `maxContexts` is deliberately retained as the
+     * total managed/login ceiling for backwards compatibility.  Routing is
+     * allowed to use a smaller READY subset while additional contexts remain
+     * warm as standby accounts.
+     */
+    getMaxManagedContexts() {
+        const value = Number(this.config?.maxContexts);
+        return Number.isInteger(value) && value >= 0 ? value : 0;
+    }
+
+    getRoutingPoolSize() {
+        const configured = Number(this.config?.routingPoolSize);
+        if (Number.isInteger(configured) && configured >= 0) return configured;
+        return this.getMaxManagedContexts();
+    }
+
+    getWarmStandbyContexts() {
+        const configured = Number(this.config?.warmStandbyContexts);
+        return Number.isInteger(configured) && configured >= 0 ? configured : 0;
+    }
+
+    getRoutingPoolLimit() {
+        const limit = this.getRoutingPoolSize();
+        return limit === 0 ? Number.POSITIVE_INFINITY : limit;
+    }
+
+    /**
+     * Number of contexts the background pool should actively keep warm.
+     * `maxContexts` remains the hard managed/login ceiling; when operators set
+     * an explicit READY pool and standby count, only READY + standby slots are
+     * preheated (bounded by that ceiling). Legacy configurations where the
+     * routing size follows maxContexts retain their original behaviour.
+     */
+    getDesiredPoolSize() {
+        const maxContexts = this.getMaxManagedContexts();
+        const routingPoolSize = this.getRoutingPoolSize();
+        const warmStandbyContexts = this.getWarmStandbyContexts();
+        if (maxContexts === 0 && routingPoolSize === 0) return 0;
+        const requested = routingPoolSize === 0 ? maxContexts : routingPoolSize + warmStandbyContexts;
+        return maxContexts === 0 ? requested : Math.min(maxContexts, requested);
+    }
+
+    /**
+     * Return currently READY managed contexts in the same rotation order used
+     * by the context pool.  This is the single source of truth for the
+     * routable READY subset; contexts after the configured limit are warm
+     * standbys and remain available for promotion when a READY account enters
+     * cooldown or is disabled.
+     */
+    getOrderedReadyAuthIndices() {
+        const rotation = (this.authSource?.getRotationIndices?.() || this.authSource?.availableIndices || []).filter(
+            authIndex => this._isContextSchedulable(authIndex)
+        );
+        const currentCanonical =
+            this._currentAuthIndex >= 0 ? this.authSource?.getCanonicalIndex?.(this._currentAuthIndex) : null;
+        const startPos =
+            currentCanonical !== null && currentCanonical !== undefined
+                ? Math.max(rotation.indexOf(currentCanonical), 0)
+                : 0;
+        const ordered = [];
+        for (let i = 0; i < rotation.length; i++) {
+            ordered.push(rotation[(startPos + i) % rotation.length]);
+        }
+        return ordered.filter(authIndex => this._isContextReady(authIndex));
+    }
+
+    getRoutingAuthIndices() {
+        const ready = this.getOrderedReadyAuthIndices();
+        const limit = this.getRoutingPoolSize();
+        return limit === 0 ? ready : ready.slice(0, limit);
+    }
+
+    getWarmStandbyAuthIndices() {
+        const ready = this.getOrderedReadyAuthIndices();
+        const limit = this.getRoutingPoolSize();
+        const routing = limit === 0 ? ready : ready.slice(0, limit);
+        const routingSet = new Set(routing);
+        const configuredStandby = this.getWarmStandbyContexts();
+        const standbys = ready.filter(authIndex => !routingSet.has(authIndex));
+        return configuredStandby > 0 ? standbys.slice(0, configuredStandby) : standbys;
+    }
+
+    _getEffectivePoolOccupancy() {
+        // A context that briefly loses its WebSocket still owns its browser
+        // slot while ConnectionRegistry is in grace/reconnect recovery. If
+        // we only counted OPEN sockets here, the preload loop could create a
+        // fourth context before the original socket re-attaches.
+        const occupiedAuthIndices = new Set();
+        for (const authIndex of this.contexts.keys()) {
+            if (!this._isContextSchedulable(authIndex)) continue;
+            if (this._isContextReady(authIndex)) {
+                occupiedAuthIndices.add(authIndex);
+                continue;
+            }
+
+            const contextData = this.contexts.get(authIndex);
+            const pageIsAlive = Boolean(contextData?.page && !contextData.page.isClosed());
+            const reconnectPending = this.connectionRegistry?.isReconnectPending?.(authIndex) === true;
+            if (pageIsAlive && reconnectPending) occupiedAuthIndices.add(authIndex);
+        }
+
+        // Initializing contexts reserve a slot before their first await. Use
+        // a Set so an initialization that already has a context entry cannot
+        // be counted twice during a reconnect/preload race.
+        for (const authIndex of this.initializingContexts) {
+            if (this._isContextSchedulable(authIndex)) occupiedAuthIndices.add(authIndex);
+        }
+        return occupiedAuthIndices.size;
     }
 
     /**
@@ -865,7 +1001,11 @@ class BrowserManager {
 
         const executablePath = this._getBrowserExecutablePath();
         if (!fs.existsSync(executablePath)) throw new Error("Browser executable not found");
-        const proxyConfig = parseProxyFromEnv();
+        // Match the account's production network path when sticky proxies are
+        // enabled; the browser is still a separate process and is never inserted
+        // into `contexts`, so it does not consume a MAX_CONTEXTS slot.
+        const stickyProxy = this.stickyProxyManager.getProxyForAuth(authIndex);
+        const proxyConfig = stickyProxy ? stickyProxy.proxy : parseProxyFromEnv();
         const logPrefix = `[AutoHealProbe#${authIndex}]`;
         const browser = await firefox.launch({
             args: this.launchArgs,
@@ -874,7 +1014,10 @@ class BrowserManager {
             headless: true,
             ...(proxyConfig ? { proxy: proxyConfig } : {}),
         });
-        this.logger.info(`${logPrefix} Isolated probe browser launched (not part of MAX_CONTEXTS).`);
+        this.logger.info(
+            `${logPrefix} Isolated probe browser launched (not part of MAX_CONTEXTS)` +
+                `${stickyProxy ? ` via ${stickyProxy.display}` : ""}.`
+        );
         try {
             const context = await browser.newContext({
                 deviceScaleFactor: 1,
@@ -911,7 +1054,10 @@ class BrowserManager {
                 // in-page WebSocket NEVER initializes and every probe timed
                 // out regardless of account health (2026-09-19 incident).
                 const continueClicked = await this._clickButtonByTextIfVisible(
-                    page, "Continue to the app", logPrefix, `popup "Continue to the app"`
+                    page,
+                    "Continue to the app",
+                    logPrefix,
+                    `popup "Continue to the app"`
                 );
                 if (continueClicked) {
                     this.logger.info(`${logPrefix} Found "Continue to the app" popup, clicked.`);
@@ -1538,9 +1684,17 @@ class BrowserManager {
      * @returns {Promise<{firstReady: number|null}>}
      */
     async preloadContextPool(startupOrder, maxContexts) {
-        const poolSize = maxContexts === 0 ? startupOrder.length : Math.min(maxContexts, startupOrder.length);
+        const schedulableStartupOrder = startupOrder.filter(authIndex => this._isContextSchedulable(authIndex));
+        const configuredMaxContexts =
+            Number.isInteger(Number(maxContexts)) && Number(maxContexts) >= 0
+                ? Number(maxContexts)
+                : this.getMaxManagedContexts();
+        const poolSize =
+            configuredMaxContexts === 0
+                ? schedulableStartupOrder.length
+                : Math.min(configuredMaxContexts, schedulableStartupOrder.length);
         this.logger.info(
-            `🚀 [ContextPool] Starting pool preload (pool=${poolSize}, order=[${startupOrder.join(", ")}])...`
+            `🚀 [ContextPool] Starting pool preload (pool=${poolSize}, order=[${schedulableStartupOrder.join(", ")}])...`
         );
 
         // Abort any existing background preload/rebalance to ensure clean state
@@ -1554,8 +1708,8 @@ class BrowserManager {
         // Synchronously try ALL indices until one succeeds (fallback beyond poolSize)
         let firstReady = null;
 
-        for (let i = 0; i < startupOrder.length; i++) {
-            const authIndex = startupOrder[i];
+        for (let i = 0; i < schedulableStartupOrder.length; i++) {
+            const authIndex = schedulableStartupOrder[i];
 
             // If already initialized, use it directly
             if (this.contexts.has(authIndex)) {
@@ -1604,7 +1758,9 @@ class BrowserManager {
 
         // Background: calculate remaining contexts using rotation order (same logic as rebalanceContextPool)
         // This ensures startup pool matches the rotation order used during account switching
-        const rotation = this.authSource.getRotationIndices();
+        const rotation = this.authSource
+            .getRotationIndices()
+            .filter(authIndex => this._isContextSchedulable(authIndex));
         const currentCanonical = this.authSource.getCanonicalIndex(firstReady);
         const startPos = currentCanonical !== null ? Math.max(rotation.indexOf(currentCanonical), 0) : 0;
         const ordered = [];
@@ -1613,7 +1769,7 @@ class BrowserManager {
         }
 
         // Calculate how many more contexts we need to reach poolSize
-        const needCount = poolSize - this.contexts.size;
+        const needCount = poolSize - this._getEffectivePoolOccupancy();
         if (needCount > 0) {
             // Get candidates from ordered list (excluding already initialized contexts)
             // Convert existing contexts to canonical indices to handle duplicate accounts
@@ -1871,11 +2027,11 @@ class BrowserManager {
                 // Reservation is synchronous inside _ensureContextForAuthUnlocked;
                 // do not hold the pool mutex across a potentially 120-second
                 // browser/WebSocket initialization.
-                if (maxPoolSize > 0 && this.contexts.size + this.initializingContexts.size >= maxPoolSize) {
+                if (maxPoolSize > 0 && this._getEffectivePoolOccupancy() >= maxPoolSize) {
                     break;
                 }
                 if (this.contexts.has(authIndex) || this.initializingContexts.has(authIndex)) continue;
-                if (this.authSource?.isUnavailable?.(authIndex)) continue;
+                if (!this._isContextSchedulable(authIndex)) continue;
                 this.logger.info(`[ContextPool] Background preload init context #${authIndex}...`);
                 const ready = await this._ensureContextForAuthUnlocked(authIndex, {
                     allowTemporaryOverflow: false,
@@ -1907,7 +2063,7 @@ class BrowserManager {
      * @param {number} targetAuthIndex - The account index we're about to switch to
      */
     async preCleanupForSwitch(targetAuthIndex) {
-        const maxContexts = this.config.maxContexts;
+        const maxContexts = this.getDesiredPoolSize();
         const isUnlimited = maxContexts === 0;
 
         // Abort any ongoing background preload task before cleanup
@@ -1947,7 +2103,7 @@ class BrowserManager {
 
         // Calculate how many contexts we'll have after adding the new one
         // Include contexts that are currently being initialized in background
-        const currentSize = this.contexts.size + this.initializingContexts.size;
+        const currentSize = this._getEffectivePoolOccupancy();
         const futureSize = currentSize + 1;
 
         // If we won't exceed the limit, no cleanup needed
@@ -1966,7 +2122,9 @@ class BrowserManager {
         // Priority 2: Expired accounts (not the target if target is expired)
         // Priority 3: Accounts in rotation, ordered by distance from target (farthest first)
 
-        const rotation = this.authSource.getRotationIndices();
+        const rotation = this.authSource
+            .getRotationIndices()
+            .filter(authIndex => this._isContextSchedulable(authIndex));
         const targetCanonical = this.authSource.getCanonicalIndex(targetAuthIndex);
         const duplicateGroups = this.authSource.getDuplicateGroups();
         const expiredIndices = this.authSource.expiredIndices || [];
@@ -2097,13 +2255,13 @@ class BrowserManager {
 
     async _ensureContextForAuthUnlocked(authIndex, options = {}) {
         if (!Number.isInteger(authIndex) || authIndex < 0) return false;
-        if (this.authSource?.isUnavailable?.(authIndex)) return false;
-        if (this.contexts.has(authIndex)) return true;
+        if (!this._isContextSchedulable(authIndex)) return false;
+        if (this.contexts.has(authIndex)) return this._isContextReady(authIndex);
         if (this._contextInitPromises.has(authIndex)) return this._contextInitPromises.get(authIndex);
 
-        if (this.contexts.has(authIndex)) return true;
-        const maxContexts = this.config.maxContexts;
-        const occupancy = this.contexts.size + this.initializingContexts.size;
+        if (this.contexts.has(authIndex)) return this._isContextReady(authIndex);
+        const maxContexts = this.getDesiredPoolSize();
+        const occupancy = this._getEffectivePoolOccupancy();
         if (maxContexts > 0 && occupancy >= maxContexts && options.allowTemporaryOverflow !== true) return false;
         // Reserve the slot before the first await. This makes the occupancy
         // check atomic from JavaScript's event-loop perspective while keeping
@@ -2192,12 +2350,14 @@ class BrowserManager {
     }
 
     async _rebalanceContextPoolOnce() {
-        const maxContexts = this.config.maxContexts;
+        const maxContexts = this.getDesiredPoolSize();
         // maxContexts === 0 means unlimited pool size
         const isUnlimited = maxContexts === 0;
 
         // Build full rotation ordered from current account
-        const rotation = this.authSource.getRotationIndices();
+        const rotation = this.authSource
+            .getRotationIndices()
+            .filter(authIndex => this._isContextSchedulable(authIndex));
         const currentCanonical =
             this._currentAuthIndex >= 0 ? this.authSource.getCanonicalIndex(this._currentAuthIndex) : null;
         const startPos = currentCanonical !== null ? Math.max(rotation.indexOf(currentCanonical), 0) : 0;
@@ -2206,17 +2366,38 @@ class BrowserManager {
             ordered.push(rotation[(startPos + i) % rotation.length]);
         }
 
+        // Preserve contexts that are already able to receive traffic before
+        // selecting cold rotation entries. This keeps an atomically warmed
+        // replacement in the pool instead of immediately closing it merely
+        // because an earlier numeric auth index has no READY WebSocket.
+        const readyOrdered = ordered.filter(authIndex => this._isContextReady(authIndex));
+        // A live context whose socket is in grace/reconnect recovery still owns
+        // a pool slot. Keep it ahead of cold accounts so a rebalance cannot
+        // close the context before its replacement socket has a chance to
+        // re-attach (which would otherwise make a cold account displace it).
+        const reconnectOrdered = ordered.filter(authIndex => {
+            if (readyOrdered.includes(authIndex)) return false;
+            const contextData = this.contexts.get(authIndex);
+            const pageIsAlive = Boolean(contextData?.page && !contextData.page.isClosed());
+            return pageIsAlive && this.connectionRegistry?.isReconnectPending?.(authIndex) === true;
+        });
+        const reconnectSet = new Set(reconnectOrdered);
+        const coldOrdered = ordered.filter(
+            authIndex => !readyOrdered.includes(authIndex) && !reconnectSet.has(authIndex)
+        );
+        const poolOrder = [...readyOrdered, ...reconnectOrdered, ...coldOrdered];
+
         // Targets = first maxContexts from ordered (or all available if unlimited)
         // In unlimited mode, include all valid accounts (rotation + duplicates), excluding expired
         let targets;
         if (isUnlimited) {
             // Filter out expired accounts from availableIndices
-            const nonExpiredAvailable = this.authSource.availableIndices.filter(
-                idx => !this.authSource.isUnavailable?.(idx)
+            const nonExpiredAvailable = this.authSource.availableIndices.filter(authIndex =>
+                this._isContextSchedulable(authIndex)
             );
             targets = new Set(nonExpiredAvailable);
         } else {
-            targets = new Set(ordered.slice(0, maxContexts));
+            targets = new Set(poolOrder.slice(0, maxContexts));
         }
 
         for (const idx of targets) {
@@ -2260,7 +2441,7 @@ class BrowserManager {
         // Don't filter out initializingContexts here - let _executePreloadTask handle it
         // This ensures that if a background task is aborted, the account will be retried
         // If a foreground task is running, _executePreloadTask will skip it (line 1382)
-        const candidates = ordered.filter(idx => !activeContexts.has(idx));
+        const candidates = poolOrder.filter(idx => !activeContexts.has(idx));
 
         const { busy, idle } = this._prioritizeContextsForRemoval(toRemove);
 
@@ -2279,7 +2460,7 @@ class BrowserManager {
         }
 
         // Preload candidates if ready and initializing contexts still leave room in the pool
-        const poolOccupancy = this.contexts.size + this.initializingContexts.size;
+        const poolOccupancy = this._getEffectivePoolOccupancy();
         return {
             candidates: candidates.length > 0 && (isUnlimited || poolOccupancy < maxContexts) ? candidates : [],
             maxPoolSize: isUnlimited ? 0 : maxContexts,
@@ -2878,6 +3059,7 @@ class BrowserManager {
         }
 
         const contextData = this.contexts.get(authIndex);
+        const registeredConnection = this.connectionRegistry?.getConnectionByAuth?.(authIndex, false);
 
         // Stop this account's Rocket/Launch worker before removing its page from
         // the context pool. Other account workers remain untouched.
@@ -2923,6 +3105,13 @@ class BrowserManager {
             }
         } catch (e) {
             this.logger.warn(`[Browser] Error closing context #${authIndex}: ${e.message}`);
+        } finally {
+            // Playwright can finish context.close() before the server-side WebSocket emits
+            // its close event. Remove exactly the socket captured for this context so it
+            // cannot remain routable or inflate READY counts after the context left the pool.
+            if (registeredConnection) {
+                this.connectionRegistry?.closeConnectionByAuth?.(authIndex, registeredConnection);
+            }
         }
 
         // If this was the last context, close the browser to free resources

@@ -3,7 +3,7 @@
 const assert = require("assert");
 const RequestHandler = require("../../src/core/RequestHandler");
 
-const logger = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
+const logger = { debug: () => {}, error: () => {}, info: () => {}, warn: () => {} };
 
 const conns = new Map();
 const mockConnectionRegistry = {
@@ -12,11 +12,11 @@ const mockConnectionRegistry = {
 };
 
 const mockBrowserManager = {
-    contexts: new Map(),
-    currentAuthIndex: 70,
     browser: { isConnected: () => true },
-    replaceContextForAuth: async () => true,
+    contexts: new Map([68, 69, 70, 71, 72, 73, 74].map(index => [index, { page: { isClosed: () => false } }])),
+    currentAuthIndex: 70,
     rebalanceContextPool: async () => {},
+    replaceContextForAuth: async () => true,
     setConnectionRegistry: () => {},
     setSystemBusyProvider: () => {},
 };
@@ -24,21 +24,14 @@ const mockBrowserManager = {
 const mockConfig = { maxContexts: 3, switchOnUses: 20 };
 const mockAuthSource = {
     availableIndices: [68, 69, 70, 71, 72, 73, 74],
-    getRotationIndices: () => [68, 69, 70, 71, 72, 73, 74],
     getCanonicalIndex: i => i,
-    isUnavailable: () => false,
+    getRotationIndices: () => [68, 69, 70, 71, 72, 73, 74],
     isExpired: () => false,
+    isUnavailable: () => false,
 };
 
 async function testQuarantineExcludesAccountFromRouting() {
-    const rh = new RequestHandler(
-        {},
-        mockConnectionRegistry,
-        logger,
-        mockBrowserManager,
-        mockConfig,
-        mockAuthSource
-    );
+    const rh = new RequestHandler({}, mockConnectionRegistry, logger, mockBrowserManager, mockConfig, mockAuthSource);
 
     assert.strictEqual(rh._isInWsCrashLoop(70), false, "account must start healthy");
 

@@ -15,6 +15,12 @@ const AuthSwitcher = require("../auth/AuthSwitcher");
 const FormatConverter = require("./FormatConverter");
 const { isUserAbortedError } = require("../utils/CustomErrors");
 const { QueueClosedError, QueueTimeoutError } = require("../utils/MessageQueue");
+const {
+    isAccountEligibleForGroup,
+    isModelAllowed,
+    normalizeModelRouting,
+    routingKey,
+} = require("../utils/ModelRouting");
 
 const WS_RECONNECT_WAIT_MS = 130000;
 const WS_CONNECTION_READY_TIMEOUT_MS = 10000;
@@ -32,10 +38,12 @@ const WS_CRASH_WINDOW_MS = 60000;
 const WS_CRASH_DROP_THRESHOLD = 3;
 const WS_CRASH_ISOLATE_MS = 120000;
 const WS_CRASH_DISABLE_AFTER_EPISODES = 2;
-const WS_CRASH_PROBE_INTERVAL_MS = 600000;
 // Default AutoHeal probe schedule (configurable at runtime via the panel):
 const AUTOHEAL_PROBE_INTERVAL_MS_DEFAULT = 5 * 60 * 60 * 1000; // 5 hours
 const AUTOHEAL_PROBE_TIMEOUT_MS_DEFAULT = 10 * 60 * 1000; // 10 minutes per account
+const AUTOHEAL_STARTUP_DELAY_MS_DEFAULT = 15000; // first scan shortly after startup
+const AUTOHEAL_BUSY_RETRY_MS_DEFAULT = 30000; // do not wait a full interval when the switcher is busy
+const AUTOHEAL_MIN_TIMER_DELAY_MS = 1000; // prevents zero-delay retry loops
 const REMOVED_AUTH_BACKUP_DIR = path.join(process.cwd(), "data", "removed-auth-backup");
 
 // Quota (HTTP 429) circuit breaker:
@@ -89,6 +97,15 @@ class RequestHandler {
         this.usageRotationPromise = null;
         this.usageRotationRetryTimer = null;
 
+        // AutoHeal scheduler state. A single due-time timer replaces setInterval
+        // so slow probes cannot overlap with the next cycle. Account probes also
+        // have their own single-flight map for callers outside the timer cycle.
+        this.autoHealTimer = null;
+        this.autoHealNextRunAt = 0;
+        this.autoHealStopped = true;
+        this.autoHealCyclePromise = null;
+        this.autoHealAccountProbes = new Map();
+
         // Timeout settings
         this.timeouts = {
             FAKE_STREAM: this.config.fakeStreamTimeoutMs || DEFAULT_TIMEOUTS.FAKE_STREAM,
@@ -108,15 +125,16 @@ class RequestHandler {
                     Object.entries(saved.modelCooldowns || {}).filter(([, until]) => Number(until) > now)
                 );
                 this.accountRouteState.set(authIndex, {
+                    autoHealNextProbeAt:
+                        Number(saved.autoHealNextProbeAt) > now ? Number(saved.autoHealNextProbeAt) : 0,
                     cooldownUntil: Number(saved.cooldownUntil) > now ? Number(saved.cooldownUntil) : 0,
-                    quotaDisabledUntil:
-                        Number(saved.quotaDisabledUntil) > now ? Number(saved.quotaDisabledUntil) : 0,
-                    quotaProbeEpisodes: Number(saved.quotaProbeEpisodes) || 0,
                     inFlight: 0,
                     lastError: saved.lastError || null,
                     lastStatus: Number.isFinite(Number(saved.lastStatus)) ? Number(saved.lastStatus) : null,
                     modelCooldowns,
                     modelRateLimitHits: saved.modelRateLimitHits || {},
+                    quotaDisabledUntil: Number(saved.quotaDisabledUntil) > now ? Number(saved.quotaDisabledUntil) : 0,
+                    quotaProbeEpisodes: Number(saved.quotaProbeEpisodes) || 0,
                     rateLimitHits: Number(saved.rateLimitHits) || 0,
                     usageCount: 0,
                     usageExhausted: false,
@@ -134,13 +152,14 @@ class RequestHandler {
         const accounts = {};
         for (const [authIndex, state] of this.accountRouteState.entries()) {
             accounts[String(authIndex)] = {
+                autoHealNextProbeAt: state.autoHealNextProbeAt || 0,
                 cooldownUntil: state.cooldownUntil || 0,
-                quotaDisabledUntil: state.quotaDisabledUntil || 0,
-                quotaProbeEpisodes: state.quotaProbeEpisodes || 0,
                 lastError: state.lastError || null,
                 lastStatus: state.lastStatus || null,
                 modelCooldowns: state.modelCooldowns || {},
                 modelRateLimitHits: state.modelRateLimitHits || {},
+                quotaDisabledUntil: state.quotaDisabledUntil || 0,
+                quotaProbeEpisodes: state.quotaProbeEpisodes || 0,
                 rateLimitHits: state.rateLimitHits || 0,
             };
         }
@@ -161,6 +180,28 @@ class RequestHandler {
         if (this.accountDisableCleanup?.has(authIndex)) return true;
         if (typeof this.authSource?.isUnavailable === "function") return this.authSource.isUnavailable(authIndex);
         return Boolean(this.authSource?.isExpired?.(authIndex));
+    }
+
+    isAccountSchedulableForContextPool(authIndex) {
+        if (!Number.isInteger(authIndex) || authIndex < 0 || this._isAuthUnavailable(authIndex)) return false;
+        if (this._isInWsCrashLoop(authIndex)) return false;
+        const state = this._getAccountRouteState(authIndex);
+        const now = Date.now();
+        return state.cooldownUntil <= now && state.quotaDisabledUntil <= now && state.usageExhausted !== true;
+    }
+
+    _isLiveManagedRequestContext(authIndex) {
+        const contexts = this.browserManager?.contexts;
+        if (!contexts || typeof contexts.get !== "function") return false;
+        const contextData = contexts.get(authIndex);
+        const page = contextData?.page;
+        if (!page || typeof page.isClosed !== "function") return false;
+        try {
+            return page.isClosed() !== true;
+        } catch (error) {
+            this.logger?.debug?.(`[Routing] Failed to inspect page for account #${authIndex}: ${error.message}`);
+            return false;
+        }
     }
 
     _normalizeRouteModel(modelName) {
@@ -192,19 +233,90 @@ class RequestHandler {
         return this._normalizeRouteModel(pathMatch ? pathMatch[1] : null);
     }
 
+    /**
+     * Resolve the optional model-pool policy. `modelRouting` is the richer
+     * grouped form; modelPoolMode/modelPoolAllowlist remain supported for the
+     * panel's compact single-server allowlist controls.
+     */
+    _getModelRoutingConfig() {
+        const explicit = this.config?.modelRouting;
+        const compactMode = String(this.config?.modelPoolMode || "all").toLowerCase();
+        // The panel always mirrors the compact allowlist into modelRouting.
+        // In `all` mode that mirror must not accidentally turn the allowlist
+        // back on after a restart.
+        if (
+            explicit &&
+            String(explicit.mode || "").toLowerCase() === "all" &&
+            compactMode === "all" &&
+            !explicit.enabled &&
+            !explicit.strict &&
+            !(Array.isArray(explicit.groups) && explicit.groups.length > 0)
+        ) {
+            return normalizeModelRouting({});
+        }
+        if (
+            compactMode === "allowlist" &&
+            explicit &&
+            !(Array.isArray(explicit.groups) && explicit.groups.length > 0) &&
+            explicit.strict === undefined &&
+            explicit.enabled === undefined
+        ) {
+            return normalizeModelRouting({ ...explicit, enabled: true, strict: true });
+        }
+        if (
+            explicit &&
+            (explicit.enabled || explicit.strict || explicit.groups?.length || explicit.allowlist?.length)
+        ) {
+            return normalizeModelRouting(explicit);
+        }
+        if (compactMode === "allowlist") {
+            return normalizeModelRouting({
+                allowlist: this.config?.modelPoolAllowlist || [],
+                enabled: true,
+                strict: true,
+            });
+        }
+        return normalizeModelRouting({});
+    }
+
+    _getModelRoutingDecision(modelName) {
+        const routing = this._getModelRoutingConfig();
+        return { ...isModelAllowed(modelName, routing), routing };
+    }
+
+    _getModelRouteKey(modelName) {
+        const decision = this._getModelRoutingDecision(modelName);
+        return routingKey(decision.model, decision.routing) || this._normalizeRouteModel(modelName);
+    }
+
+    getModelRoutingStatus() {
+        const routing = this._getModelRoutingConfig();
+        return {
+            ...routing,
+            allowlist: routing.allowlist || [],
+            mode: routing.enabled ? "allowlist" : "all",
+        };
+    }
+
     async _warmStandbyForModel(modelName, excluded = []) {
         const routeModel = this._normalizeRouteModel(modelName);
         if (!routeModel || !this.browserManager?.ensureContextForAuth) return false;
+        const routingDecision = this._getModelRoutingDecision(routeModel);
+        if (!routingDecision.allowed) return false;
+        const routeGroup = routingDecision.group;
+        const routeKey = this._getModelRouteKey(routeModel);
         const excludedSet = new Set(excluded);
         const candidate = (this.authSource?.getRotationIndices?.() || this.authSource?.availableIndices || [])
             .filter(index => !excludedSet.has(index) && !this.browserManager.contexts.has(index))
             .filter(index => !this._isAuthUnavailable(index))
+            .filter(index => isAccountEligibleForGroup(index, routeGroup, this.authSource))
             .find(index => {
                 const state = this._getAccountRouteState(index);
                 return (
                     state.cooldownUntil <= Date.now() &&
+                    (state.quotaDisabledUntil || 0) <= Date.now() &&
                     !state.usageExhausted &&
-                    (state.modelCooldowns?.[routeModel] || 0) <= Date.now()
+                    (state.modelCooldowns?.[routeKey] || 0) <= Date.now()
                 );
             });
         if (!Number.isInteger(candidate)) return false;
@@ -224,15 +336,38 @@ class RequestHandler {
         return warmed;
     }
 
+    _limitActiveIndicesToRoutingPool(activeIndices) {
+        if (!Array.isArray(activeIndices) || activeIndices.length === 0) return [];
+        const manager = this.browserManager;
+        const configuredLimit = Number(manager?.getRoutingPoolSize?.() ?? this.config?.routingPoolSize);
+        if (!Number.isInteger(configuredLimit) || configuredLimit <= 0) return activeIndices;
+
+        // Prefer the explicit READY subset, then promote warm standbys only
+        // when a preferred account is unavailable (429/cooldown/disable). This
+        // keeps a configured N-account routing pool while allowing a standby to
+        // replace a failed slot without opening another browser context.
+        const preferred = new Set(manager?.getRoutingAuthIndices?.() || []);
+        const preferredActive = activeIndices.filter(index => preferred.has(index));
+        if (preferredActive.length >= configuredLimit) return preferredActive.slice(0, configuredLimit);
+        const standbyActive = activeIndices.filter(index => !preferred.has(index));
+        return [...preferredActive, ...standbyActive.slice(0, configuredLimit - preferredActive.length)];
+    }
+
     _selectRequestAuthIndex(excluded = [], modelName = null) {
         const excludedSet = new Set(excluded.filter(index => Number.isInteger(index) && index >= 0));
         const routeModel = this._normalizeRouteModel(modelName);
+        const routingDecision = this._getModelRoutingDecision(routeModel);
+        const routeGroup = routingDecision.group;
+        const routeKey = this._getModelRouteKey(routeModel);
+        this.lastRouteSelectionError = routingDecision.allowed ? null : routingDecision.reason || "model_not_in_pool";
+        if (!routingDecision.allowed) return -1;
         const now = Date.now();
-        const activeIndices = [...this.connectionRegistry.getAllConnections().entries()]
+        const allActiveIndices = [...this.connectionRegistry.getAllConnections().entries()]
             .filter(([, connection]) => connection && connection.readyState === 1)
             .map(([authIndex]) => authIndex)
             .filter(authIndex => {
                 if (excludedSet.has(authIndex)) return false;
+                if (!this._isLiveManagedRequestContext(authIndex)) return false;
                 if (
                     Array.isArray(this.authSource?.availableIndices) &&
                     !this.authSource.availableIndices.includes(authIndex)
@@ -240,13 +375,16 @@ class RequestHandler {
                     return false;
                 }
                 if (this._isAuthUnavailable(authIndex)) return false;
+                if (!isAccountEligibleForGroup(authIndex, routeGroup, this.authSource)) return false;
                 if (this._isInWsCrashLoop(authIndex)) return false;
                 const routeState = this.accountRouteState.get(authIndex);
                 if (routeState?.cooldownUntil > now) return false;
+                if (routeState?.quotaDisabledUntil > now) return false;
                 if (this._isPerAccountUsageRoutingEnabled() && routeState?.usageExhausted) return false;
-                return !routeModel || (routeState?.modelCooldowns?.[routeModel] || 0) <= now;
+                return !routeKey || (routeState?.modelCooldowns?.[routeKey] || 0) <= now;
             })
             .sort((a, b) => a - b);
+        const activeIndices = this._limitActiveIndicesToRoutingPool(allActiveIndices);
 
         if (activeIndices.length === 0) {
             const current = this.currentAuthIndex;
@@ -260,11 +398,14 @@ class RequestHandler {
                     this.authSource.availableIndices.includes(current)) &&
                 !this._isAuthUnavailable(current) &&
                 !this._isInWsCrashLoop(current) &&
+                isAccountEligibleForGroup(current, routeGroup, this.authSource) &&
+                this._isLiveManagedRequestContext(current) &&
                 currentConnection &&
                 currentConnection.readyState === 1 &&
                 (!currentState?.cooldownUntil || currentState.cooldownUntil <= now) &&
+                (!currentState?.quotaDisabledUntil || currentState.quotaDisabledUntil <= now) &&
                 (!this._isPerAccountUsageRoutingEnabled() || !currentState?.usageExhausted) &&
-                (!routeModel || (currentState?.modelCooldowns?.[routeModel] || 0) <= now);
+                (!routeKey || (currentState?.modelCooldowns?.[routeKey] || 0) <= now);
             return currentAvailable ? current : -1;
         }
 
@@ -281,40 +422,44 @@ class RequestHandler {
     _getAccountRouteState(authIndex) {
         if (!Number.isInteger(authIndex) || authIndex < 0) {
             return {
+                autoHealNextProbeAt: 0,
                 cooldownUntil: 0,
+                crashLoopEpisodes: 0,
                 inFlight: 0,
                 lastError: null,
                 lastStatus: null,
                 modelCooldowns: {},
                 modelRateLimitHits: {},
+                quotaDisabledUntil: 0,
+                quotaProbeEpisodes: 0,
                 rateLimitHits: 0,
                 usageCount: 0,
                 usageExhausted: false,
                 usageExhaustedAt: 0,
+                wsCrashLoopUntil: 0,
                 wsDropCount: 0,
                 wsDropWindowStart: 0,
-                wsCrashLoopUntil: 0,
-                crashLoopEpisodes: 0,
-                quotaDisabledUntil: 0,
-                quotaProbeEpisodes: 0,
             };
         }
         if (!this.accountRouteState.has(authIndex)) {
             this.accountRouteState.set(authIndex, {
+                autoHealNextProbeAt: 0,
                 cooldownUntil: 0,
+                crashLoopEpisodes: 0,
                 inFlight: 0,
                 lastError: null,
                 lastStatus: null,
                 modelCooldowns: {},
                 modelRateLimitHits: {},
+                quotaDisabledUntil: 0,
+                quotaProbeEpisodes: 0,
                 rateLimitHits: 0,
                 usageCount: 0,
                 usageExhausted: false,
                 usageExhaustedAt: 0,
+                wsCrashLoopUntil: 0,
                 wsDropCount: 0,
                 wsDropWindowStart: 0,
-                wsCrashLoopUntil: 0,
-                crashLoopEpisodes: 0,
             });
         }
         const state = this.accountRouteState.get(authIndex);
@@ -329,6 +474,9 @@ class RequestHandler {
             state.wsDropWindowStart = 0;
             state.wsCrashLoopUntil = 0;
             state.crashLoopEpisodes = 0;
+        }
+        if (typeof state.autoHealNextProbeAt !== "number") {
+            state.autoHealNextProbeAt = 0;
         }
         return state;
     }
@@ -370,6 +518,11 @@ class RequestHandler {
                     `Quarantined from routing/recovery until ${new Date(state.wsCrashLoopUntil).toISOString()} ` +
                     `(crash-loop episode ${episodes}/${WS_CRASH_DISABLE_AFTER_EPISODES} before auto-disable).`
             );
+            // Count distinct threshold windows as episodes. Without resetting
+            // here, the very next disconnect after the first threshold would
+            // immediately count as another full crash-loop episode.
+            state.wsDropCount = 0;
+            state.wsDropWindowStart = now;
 
             // Repeated crash-loop episodes escalate to an automatic disable so the
             // account fully leaves rotation (persisted to its auth file) instead of
@@ -377,11 +530,14 @@ class RequestHandler {
             if (episodes >= WS_CRASH_DISABLE_AFTER_EPISODES) {
                 let disabled = false;
                 try {
-                    disabled = await this.authSource?.disableAuth?.(authIndex, { reason: "crash_loop" }) === true;
+                    disabled = (await this.authSource?.disableAuth?.(authIndex, { reason: "crash_loop" })) === true;
                 } catch (e) {
                     this.logger.error(`[System] Failed to auto-disable account #${authIndex}: ${e.message}`);
                 }
                 if (disabled) {
+                    state.autoHealNextProbeAt = now + this._getAutoHealProbeIntervalMs();
+                    this._persistAccountRouteState();
+                    this._requestAutoHealReschedule("crash_loop_disabled");
                     this.logger.error(
                         `⛔ [System] Account #${authIndex} auto-disabled after ${episodes} crash-loop episodes ` +
                             `(reason: crash_loop). Auto-heal probe will re-test it periodically.`
@@ -394,6 +550,13 @@ class RequestHandler {
                         }
                     } catch (e) {
                         this.logger.warn(`[System] Failed to close context #${authIndex}: ${e.message}`);
+                    }
+                    try {
+                        await this.browserManager?.rebalanceContextPool?.();
+                    } catch (e) {
+                        this.logger.warn(
+                            `[System] Failed to refill READY pool after disabling #${authIndex}: ${e.message}`
+                        );
                     }
                 }
             }
@@ -412,24 +575,41 @@ class RequestHandler {
      * throwaway browser so it never competes with the MAX_CONTEXTS pool.
      */
     startAutoHealProbe() {
-        this._startAutoHealTimer();
+        this.autoHealStopped = false;
+        this._scheduleAutoHealProbe(this._getAutoHealStartupDelayMs(), "startup_scan");
+        this.logger.info(
+            `[AutoHeal] Initial disabled-account scan scheduled in ` +
+                `${Math.round(this._getAutoHealStartupDelayMs() / 1000)} seconds.`
+        );
     }
 
     _startAutoHealTimer() {
-        if (this.autoHealTimer) clearInterval(this.autoHealTimer);
-        const interval = Number(this.config?.autoHealProbeIntervalMs) > 0
-            ? Number(this.config.autoHealProbeIntervalMs)
-            : AUTOHEAL_PROBE_INTERVAL_MS_DEFAULT;
-        this.autoHealTimer = setInterval(() => {
-            this._runAutoHealProbe().catch(error => {
-                this.logger.error(`[AutoHeal] Probe cycle failed: ${error.message}`);
-            });
-        }, interval);
-        if (typeof this.autoHealTimer.unref === "function") this.autoHealTimer.unref();
+        // Runtime interval changes should be reflected in already-disabled
+        // accounts. Clear their derived due times, then arm one earliest-due timer.
+        this.autoHealStopped = false;
+        for (const authIndex of this.authSource?.availableIndices || []) {
+            const reason = this.authSource?.getStatusMetadata?.(authIndex)?.disabledReason;
+            if (reason === "crash_loop" || reason === "quota_exhausted") {
+                this._getAccountRouteState(authIndex).autoHealNextProbeAt = 0;
+            }
+        }
+        this._scheduleNextAutoHealProbe("settings_rearmed");
         this.logger.info(
-            `[AutoHeal] Disabled-account probe scheduled every ${Math.round(interval / 60000)} minutes ` +
-                `(isolated browser, never gives up).`
+            `[AutoHeal] Disabled-account scheduler re-armed (interval ` +
+                `${Math.round(this._getAutoHealProbeIntervalMs() / 60000)} minutes, isolated browser).`
         );
+    }
+
+    stopAutoHealProbe() {
+        this.autoHealStopped = true;
+        if (this.autoHealTimer) clearTimeout(this.autoHealTimer);
+        this.autoHealTimer = null;
+        this.autoHealNextRunAt = 0;
+    }
+
+    _getAutoHealProbeIntervalMs() {
+        const value = Number(this.config?.autoHealProbeIntervalMs);
+        return Number.isFinite(value) && value > 0 ? value : AUTOHEAL_PROBE_INTERVAL_MS_DEFAULT;
     }
 
     _getAutoHealProbeTimeoutMs() {
@@ -437,30 +617,130 @@ class RequestHandler {
         return Number.isFinite(value) && value > 0 ? value : AUTOHEAL_PROBE_TIMEOUT_MS_DEFAULT;
     }
 
-    async _runAutoHealProbe() {
+    _getAutoHealStartupDelayMs() {
+        const value = Number(this.config?.autoHealStartupDelayMs);
+        return Number.isFinite(value) && value >= 0 ? value : AUTOHEAL_STARTUP_DELAY_MS_DEFAULT;
+    }
+
+    _getAutoHealBusyRetryMs() {
+        const value = Number(this.config?.autoHealBusyRetryMs);
+        return Number.isFinite(value) && value > 0 ? value : AUTOHEAL_BUSY_RETRY_MS_DEFAULT;
+    }
+
+    _scheduleAutoHealProbe(delayMs, reason = "scheduled") {
+        if (this.autoHealStopped) return;
+        if (this.autoHealTimer) clearTimeout(this.autoHealTimer);
+        const normalizedDelay = Math.max(
+            AUTOHEAL_MIN_TIMER_DELAY_MS,
+            Number.isFinite(Number(delayMs)) ? Number(delayMs) : this._getAutoHealProbeIntervalMs()
+        );
+        this.autoHealNextRunAt = Date.now() + normalizedDelay;
+        this.autoHealTimer = setTimeout(() => {
+            this.autoHealTimer = null;
+            this.autoHealNextRunAt = 0;
+            this._runAutoHealProbe().catch(error => {
+                this.logger.error(`[AutoHeal] Probe cycle failed: ${error.message}`);
+            });
+        }, normalizedDelay);
+        if (typeof this.autoHealTimer.unref === "function") this.autoHealTimer.unref();
+        this.logger.debug(`[AutoHeal] Next scan scheduled in ${Math.ceil(normalizedDelay / 1000)}s (${reason}).`);
+    }
+
+    _getAutoHealDueAt(authIndex, reason, status, now = Date.now()) {
+        const state = this._getAccountRouteState(authIndex);
+        if (Number(state.autoHealNextProbeAt) > 0) return Number(state.autoHealNextProbeAt);
+
+        const disabledAt = Date.parse(status?.disabledAt || "");
+        if (reason === "quota_exhausted") {
+            state.autoHealNextProbeAt =
+                Number(state.quotaDisabledUntil) > 0
+                    ? Number(state.quotaDisabledUntil)
+                    : Number.isFinite(disabledAt)
+                      ? disabledAt + QUOTA_EXHAUST_DISABLE_MS
+                      : now;
+        } else {
+            const scheduledAt = Number.isFinite(disabledAt) ? disabledAt + this._getAutoHealProbeIntervalMs() : now;
+            state.autoHealNextProbeAt = Math.max(Number(state.wsCrashLoopUntil) || 0, scheduledAt);
+        }
+        return state.autoHealNextProbeAt;
+    }
+
+    _scheduleNextAutoHealProbe(reason = "next_due") {
+        if (this.autoHealStopped) return;
+        const now = Date.now();
+        let nextDueAt = now + this._getAutoHealProbeIntervalMs();
+        for (const authIndex of this.authSource?.availableIndices || []) {
+            const status = this.authSource?.getStatusMetadata?.(authIndex);
+            const disabledReason = status?.disabledReason;
+            if (Number(status?.disabledStatus) === 503 || disabledReason === "http_503") {
+                nextDueAt = Math.min(
+                    nextDueAt,
+                    Number(this._getAccountRouteState(authIndex).autoHealNextProbeAt) || now
+                );
+                continue;
+            }
+            if (disabledReason === "forbidden") {
+                nextDueAt = Math.min(
+                    nextDueAt,
+                    Number(this._getAccountRouteState(authIndex).autoHealNextProbeAt) || now
+                );
+                continue;
+            }
+            if (disabledReason !== "crash_loop" && disabledReason !== "quota_exhausted") continue;
+            nextDueAt = Math.min(nextDueAt, this._getAutoHealDueAt(authIndex, disabledReason, status, now));
+        }
+        this._scheduleAutoHealProbe(Math.max(0, nextDueAt - now), reason);
+    }
+
+    _requestAutoHealReschedule(reason) {
+        if (!this.autoHealStopped) this._scheduleNextAutoHealProbe(reason);
+    }
+
+    _runAutoHealProbe() {
+        if (this.autoHealCyclePromise) {
+            this.logger.debug("[AutoHeal] Probe cycle already running; joining existing cycle.");
+            return this.autoHealCyclePromise;
+        }
+
+        const cyclePromise = Promise.resolve()
+            .then(() => this._runAutoHealProbeCycle())
+            .finally(() => {
+                if (this.autoHealCyclePromise === cyclePromise) this.autoHealCyclePromise = null;
+                if (!this.autoHealStopped) this._scheduleNextAutoHealProbe("cycle_complete");
+            });
+        this.autoHealCyclePromise = cyclePromise;
+        return cyclePromise;
+    }
+
+    async _runAutoHealProbeCycle() {
         const candidates = [];
         const crashLoop = [];
         const quotaExhausted = [];
         const forbidden = [];
+        const transient503 = [];
+        const now = Date.now();
         for (const authIndex of this.authSource?.availableIndices || []) {
             const status = this.authSource?.getStatusMetadata?.(authIndex);
             if (!status || !status.disabledReason) continue;
             const reason = status.disabledReason;
+            if (Number(status.disabledStatus) === 503 || reason === "http_503") {
+                if (Number(this._getAccountRouteState(authIndex).autoHealNextProbeAt) > now) continue;
+                transient503.push(authIndex);
+                continue;
+            }
             if (reason === "forbidden") {
+                if (Number(this._getAccountRouteState(authIndex).autoHealNextProbeAt) > now) continue;
                 // Google account-level ban: no point keeping the file around.
                 forbidden.push(authIndex);
                 continue;
             }
+            if (reason === "crash_loop" || reason === "quota_exhausted") {
+                if (this._getAutoHealDueAt(authIndex, reason, status, now) > now) continue;
+            }
             if (reason === "crash_loop") {
-                // Still quarantined: wait for the quarantine window to pass.
-                const state = this._getAccountRouteState(authIndex);
-                if (state.wsCrashLoopUntil > Date.now()) continue;
                 crashLoop.push(authIndex);
                 candidates.push(authIndex);
             } else if (reason === "quota_exhausted") {
-                // Quota window not elapsed yet: wait for it to pass.
-                const state = this._getAccountRouteState(authIndex);
-                if (state.quotaDisabledUntil > Date.now()) continue;
                 quotaExhausted.push(authIndex);
                 candidates.push(authIndex);
             }
@@ -468,8 +748,11 @@ class RequestHandler {
         if (forbidden.length > 0) {
             await this._removeForbiddenAccounts(forbidden);
         }
+        if (transient503.length > 0) {
+            await this._restoreTransient503Accounts(transient503);
+        }
         if (candidates.length === 0) {
-            if (forbidden.length === 0) {
+            if (forbidden.length === 0 && transient503.length === 0) {
                 this.logger.info("[AutoHeal] Probe cycle: no disabled accounts to test.");
             }
             return;
@@ -488,10 +771,34 @@ class RequestHandler {
         }
     }
 
-    async _probeAndRestoreAccount(authIndex, reason = "crash_loop") {
-        if (this.authSwitcher?.isSystemBusy) {
-            this.logger.info(`[AutoHeal] System busy, skipping probe for #${authIndex}.`);
-            return { skipped: true, reason: "busy" };
+    _probeAndRestoreAccount(authIndex, reason = "crash_loop") {
+        const inFlight = this.autoHealAccountProbes.get(authIndex);
+        if (inFlight) {
+            this.logger.debug(`[AutoHeal] Probe #${authIndex} already running; joining it.`);
+            return inFlight;
+        }
+
+        const probePromise = Promise.resolve()
+            .then(() => this._probeAndRestoreAccountOnce(authIndex, reason))
+            .finally(() => {
+                if (this.autoHealAccountProbes.get(authIndex) === probePromise) {
+                    this.autoHealAccountProbes.delete(authIndex);
+                }
+            });
+        this.autoHealAccountProbes.set(authIndex, probePromise);
+        return probePromise;
+    }
+
+    async _probeAndRestoreAccountOnce(authIndex, reason = "crash_loop") {
+        if (this.isSystemBusy) {
+            const retryAt = Date.now() + this._getAutoHealBusyRetryMs();
+            this._getAccountRouteState(authIndex).autoHealNextProbeAt = retryAt;
+            this._persistAccountRouteState();
+            this.logger.info(
+                `[AutoHeal] System busy, retrying probe #${authIndex} in ` +
+                    `${Math.ceil(this._getAutoHealBusyRetryMs() / 1000)}s.`
+            );
+            return { reason: "busy", retryAt, skipped: true };
         }
         // Probe = isolated verification: launch a throwaway browser OUTSIDE the
         // MAX_CONTEXTS pool, verify page + in-page WebSocket, then enable the
@@ -504,12 +811,11 @@ class RequestHandler {
             );
             if (!verified) {
                 this.logger.warn(`[AutoHeal] #${authIndex} isolated probe returned false, keeping disabled.`);
-                return { restored: false, reason: "probe_failed" };
+                throw new Error("Isolated probe returned false");
             }
             const enabled = await this.authSource.enableAuth(authIndex);
             if (!enabled) {
-                this.logger.warn(`[AutoHeal] enableAuth(#${authIndex}) returned false, keeping disabled.`);
-                return { restored: false, reason: "enable_failed" };
+                throw new Error(`enableAuth(#${authIndex}) returned false`);
             }
             // Healthy: clear the failure counters so the account starts clean.
             const state = this._getAccountRouteState(authIndex);
@@ -517,32 +823,76 @@ class RequestHandler {
             state.wsDropWindowStart = 0;
             state.wsCrashLoopUntil = 0;
             state.crashLoopEpisodes = 0;
+            state.autoHealNextProbeAt = 0;
             if (reason === "quota_exhausted") {
                 state.quotaDisabledUntil = 0;
                 state.quotaProbeEpisodes = 0;
             }
-            this.logger.error(`✅ [AutoHeal] Account #${authIndex} probed OK, restored to rotation.`);
+            this._persistAccountRouteState();
+            try {
+                await this.browserManager?.rebalanceContextPool?.();
+            } catch (error) {
+                this.logger.warn(`[AutoHeal] Restored #${authIndex}, but pool rebalance failed: ${error.message}`);
+            }
+            this.logger.info(`✅ [AutoHeal] Account #${authIndex} probed OK, restored to rotation.`);
             return { restored: true };
         } catch (error) {
-            // Not healthy yet: keep the account disabled (persisted) and retry on
-            // the next probe cycle — no episode cap, we probe forever.
-            try {
-                await this.authSource.disableAuth(authIndex, { reason });
-            } catch (e) {
-                this.logger.warn(`[AutoHeal] Re-disable #${authIndex} failed: ${e.message}`);
-            }
+            // The account was never enabled before verification completed, so do
+            // not rewrite its auth file on every failed probe. This preserves a
+            // more specific classification (for example "forbidden") made by the
+            // page checker and avoids moving disabledAt on every retry.
             const state = this._getAccountRouteState(authIndex);
-            if (reason === "quota_exhausted") {
-                state.quotaProbeEpisodes = (state.quotaProbeEpisodes || 0) + 1;
+            const currentReason = this.authSource?.getStatusMetadata?.(authIndex)?.disabledReason;
+            if (currentReason === "forbidden" || currentReason === "expired") {
+                state.autoHealNextProbeAt = 0;
             } else {
-                state.crashLoopEpisodes = (state.crashLoopEpisodes || 0) + 1;
+                state.autoHealNextProbeAt = Date.now() + this._getAutoHealProbeIntervalMs();
+                if (reason === "quota_exhausted") {
+                    state.quotaProbeEpisodes = (state.quotaProbeEpisodes || 0) + 1;
+                } else {
+                    state.crashLoopEpisodes = (state.crashLoopEpisodes || 0) + 1;
+                }
             }
             this._persistAccountRouteState();
             this.logger.warn(
                 `[AutoHeal] Account #${authIndex} probe failed (${error.message}), kept disabled. ` +
                     `Will retry next cycle (probing never gives up).`
             );
-            return { restored: false, reason: error.message };
+            return { reason: error.message, restored: false };
+        }
+    }
+
+    async _restoreTransient503Accounts(indices) {
+        let restored = 0;
+        let stateChanged = false;
+        for (const authIndex of indices) {
+            try {
+                if (await this.authSource.enableAuth(authIndex)) {
+                    this._getAccountRouteState(authIndex).autoHealNextProbeAt = 0;
+                    restored += 1;
+                    stateChanged = true;
+                    this.logger.info(
+                        `[AutoHeal] Cleared legacy persistent HTTP 503 disable for account #${authIndex}.`
+                    );
+                } else {
+                    this._getAccountRouteState(authIndex).autoHealNextProbeAt =
+                        Date.now() + this._getAutoHealBusyRetryMs();
+                    stateChanged = true;
+                    this.logger.warn(`[AutoHeal] enableAuth(#${authIndex}) returned false while clearing HTTP 503.`);
+                }
+            } catch (error) {
+                this._getAccountRouteState(authIndex).autoHealNextProbeAt = Date.now() + this._getAutoHealBusyRetryMs();
+                stateChanged = true;
+                this.logger.warn(`[AutoHeal] Failed to clear HTTP 503 disable for #${authIndex}: ${error.message}`);
+            }
+        }
+        if (stateChanged) this._persistAccountRouteState();
+        if (restored > 0) {
+            try {
+                await this.browserManager?.rebalanceContextPool?.();
+            } catch (error) {
+                this.logger.warn(`[AutoHeal] 503 restore rebalance failed: ${error.message}`);
+            }
         }
     }
 
@@ -552,6 +902,7 @@ class RequestHandler {
      * removal so a misclassification can still be recovered manually.
      */
     async _removeForbiddenAccounts(indices) {
+        let removedAny = false;
         for (const authIndex of indices) {
             const name = this.authSource?.accountNameMap?.get?.(authIndex) || "unknown";
             this.logger.warn(
@@ -566,11 +917,15 @@ class RequestHandler {
                     fs.copyFileSync(src, path.join(REMOVED_AUTH_BACKUP_DIR, `auth-${authIndex}-${stamp}.json`));
                 }
                 this.authSource.removeAuth(authIndex);
+                removedAny = true;
                 this.logger.warn(`[AutoHeal] Account #${authIndex} (${name}) removed.`);
             } catch (e) {
+                this._getAccountRouteState(authIndex).autoHealNextProbeAt = Date.now() + this._getAutoHealBusyRetryMs();
+                this._persistAccountRouteState();
                 this.logger.error(`[AutoHeal] Failed to remove forbidden account #${authIndex}: ${e.message}`);
             }
         }
+        if (removedAny) this.authSource?.reloadAuthSources?.();
     }
 
     _incrementGenerationUsage(requestId, fallbackAuthIndex, label) {
@@ -820,24 +1175,25 @@ class RequestHandler {
         const max = Math.max(base, this.config.accountCooldownMaxMs || 1800000);
         const retryAfterMs = this._parseRetryAfterMs(errorDetails);
         const routeModel = this._normalizeRouteModel(modelName);
-        const hitCount = routeModel ? state.modelRateLimitHits[routeModel] || 0 : state.rateLimitHits;
+        const routeKey = routeModel ? this._getModelRouteKey(routeModel) : null;
+        const hitCount = routeKey ? state.modelRateLimitHits[routeKey] || 0 : state.rateLimitHits;
         const backoffMs = Math.min(max, base * 2 ** Math.min(hitCount, 3));
         const cooldownMs = Math.min(max, Math.max(retryAfterMs, backoffMs));
         const cooldownUntil = Date.now() + cooldownMs;
-        if (routeModel) {
-            state.modelCooldowns[routeModel] = Math.max(state.modelCooldowns[routeModel] || 0, cooldownUntil);
+        if (routeKey) {
+            state.modelCooldowns[routeKey] = Math.max(state.modelCooldowns[routeKey] || 0, cooldownUntil);
         } else {
             state.cooldownUntil = cooldownUntil;
         }
         state.lastError = errorDetails?.message || "Upstream returned HTTP 429";
         state.lastStatus = 429;
-        if (routeModel) {
-            state.modelRateLimitHits[routeModel] = hitCount + 1;
+        if (routeKey) {
+            state.modelRateLimitHits[routeKey] = hitCount + 1;
         } else {
             state.rateLimitHits += 1;
         }
         this.logger.warn(
-            `[Routing] Account #${authIndex} entered ${routeModel ? `model "${routeModel}" ` : ""}429 cooldown for ${Math.ceil(cooldownMs / 1000)}s; matching requests will skip it.`
+            `[Routing] Account #${authIndex} entered ${routeKey ? `model-pool "${routeKey}" ` : ""}429 cooldown for ${Math.ceil(cooldownMs / 1000)}s; matching requests will skip it.`
         );
         this._persistAccountRouteState();
     }
@@ -848,10 +1204,11 @@ class RequestHandler {
         state.lastError = null;
         state.lastStatus = 200;
         const routeModel = this._normalizeRouteModel(modelName);
-        if (routeModel) {
-            state.modelRateLimitHits[routeModel] = 0;
-            if (state.modelCooldowns[routeModel] <= Date.now()) {
-                delete state.modelCooldowns[routeModel];
+        const routeKey = routeModel ? this._getModelRouteKey(routeModel) : null;
+        if (routeKey) {
+            state.modelRateLimitHits[routeKey] = 0;
+            if (state.modelCooldowns[routeKey] <= Date.now()) {
+                delete state.modelCooldowns[routeKey];
                 this._persistAccountRouteState();
             }
         } else {
@@ -867,17 +1224,44 @@ class RequestHandler {
         }
     }
 
-    _markImmediateRateLimitIfNeeded(authIndex, modelName, errorDetails) {
-        if (Number(errorDetails?.status) === 429) {
-            this._markAccount429ForModel(authIndex, modelName, errorDetails);
-            // Quota circuit breaker: a single upstream 429 temporarily disables the
-            // credential and routes the pool to other credentials. Fire-and-forget;
-            // the disable cleanup is single-flight per account.
-            this._quotaExhaustDisableAccount(authIndex, errorDetails).catch(error =>
-                this.logger.warn(`[Routing] Quota disable failed for account #${authIndex}: ${error.message}`)
-            );
+    _tripQuotaBreaker(authIndex, modelName, errorDetails) {
+        const status = Number(errorDetails?.status ?? errorDetails?.statusCode ?? errorDetails?.code);
+        if (status !== 429 || !Number.isInteger(authIndex) || authIndex < 0) return false;
+
+        const state = this._getAccountRouteState(authIndex);
+        const now = Date.now();
+        const routeModel = this._normalizeRouteModel(modelName);
+        const routing = this._getModelRoutingConfig();
+        // In a model-partitioned deployment a known model's quota is scoped to
+        // that model/group.  Keep the credential alive for other groups rather
+        // than persisting a global AuthSource disable.
+        if (routeModel && routing.enabled) {
+            this._markAccount429ForModel(authIndex, routeModel, errorDetails);
+            return true;
         }
-        this._autoDisableAccountForStatus(authIndex, errorDetails);
+        const alreadyOpen =
+            state.quotaDisabledUntil > now ||
+            this.accountDisableCleanup?.has(authIndex) ||
+            this.authSource?.getStatusMetadata?.(authIndex)?.disabledReason === "quota_exhausted";
+
+        // The same upstream failure is observed by the retry loop and then again
+        // by final-failure handling. Record one cooldown/hit and keep shutdown
+        // single-flight instead of exponentially extending the same 429.
+        if (!alreadyOpen) {
+            this._markAccount429ForModel(authIndex, modelName, errorDetails);
+        }
+        this._quotaExhaustDisableAccount(authIndex, errorDetails).catch(error =>
+            this.logger.warn(`[Routing] Quota disable failed for account #${authIndex}: ${error.message}`)
+        );
+        return true;
+    }
+
+    _markImmediateRateLimitIfNeeded(authIndex, modelName, errorDetails) {
+        // 429 must take the quota path even when operators also list 429 in
+        // autoDisableStatusCodes; otherwise disabledReason becomes http_429 and
+        // the AutoHeal quota probe will never pick the account up.
+        if (this._tripQuotaBreaker(authIndex, modelName, errorDetails)) return true;
+        return this._autoDisableAccountForStatus(authIndex, errorDetails);
     }
 
     _shouldSwitchImmediatelyForStatus(status) {
@@ -890,6 +1274,10 @@ class RequestHandler {
 
     _autoDisableAccountForStatus(authIndex, errorDetails) {
         const status = Number(errorDetails?.status);
+        // HTTP 503 is an availability signal, not credential revocation. It may
+        // trigger immediate failover, but must never be persisted as disabled
+        // even if an older runtime setting still lists 503 in auto-disable codes.
+        if (status === 503) return false;
         const configured = Array.isArray(this.config?.autoDisableStatusCodes)
             ? this.config.autoDisableStatusCodes
             : [401, 403];
@@ -939,17 +1327,22 @@ class RequestHandler {
      */
     async _quotaExhaustDisableAccount(authIndex, errorDetails) {
         if (!Number.isInteger(authIndex) || authIndex < 0) return false;
+        if (this.accountDisableCleanup?.has(authIndex)) {
+            return this.accountDisableCleanup.get(authIndex);
+        }
         if (this._isAuthUnavailable(authIndex)) return false; // already disabled/expired
-        if (this.accountDisableCleanup?.has(authIndex)) return true; // single-flight
 
         const state = this._getAccountRouteState(authIndex);
-        state.quotaDisabledUntil = Date.now() + QUOTA_EXHAUST_DISABLE_MS;
+        const disableMs = Math.max(QUOTA_EXHAUST_DISABLE_MS, this._parseRetryAfterMs(errorDetails));
+        state.quotaDisabledUntil = Math.max(state.quotaDisabledUntil || 0, Date.now() + disableMs);
+        state.autoHealNextProbeAt = state.quotaDisabledUntil;
         state.lastError = errorDetails?.message || "Upstream returned HTTP 429";
         state.lastStatus = 429;
         this._persistAccountRouteState();
+        this._requestAutoHealReschedule("quota_disabled");
         this.logger.warn(
             `[Routing] Quota 429 on account #${authIndex}: temporarily disabling for ` +
-                `${QUOTA_EXHAUST_DISABLE_MS / 60000}min and switching to another credential.`
+                `${Math.ceil(disableMs / 60000)}min and switching to another credential.`
         );
 
         const disableOperation = this.authSource?.isDisabled?.(authIndex)
@@ -1001,6 +1394,8 @@ class RequestHandler {
             modelCooldowns: Object.fromEntries(
                 Object.entries(state.modelCooldowns || {}).filter(([, until]) => until > Date.now())
             ),
+            quotaDisabledUntil:
+                state.quotaDisabledUntil > Date.now() ? new Date(state.quotaDisabledUntil).toISOString() : null,
             rateLimitHits: state.rateLimitHits,
             usageCount: state.usageCount,
             usageExhausted: state.usageExhausted,
@@ -1011,11 +1406,13 @@ class RequestHandler {
     getNextCooldownMs(modelName = null) {
         const now = Date.now();
         const routeModel = this._normalizeRouteModel(modelName);
+        const routeKey = routeModel ? this._getModelRouteKey(routeModel) : null;
         const remaining = [...this.accountRouteState.values()]
             .flatMap(state => {
                 const values = state.cooldownUntil > now ? [state.cooldownUntil - now] : [];
-                if (routeModel && state.modelCooldowns?.[routeModel] > now) {
-                    values.push(state.modelCooldowns[routeModel] - now);
+                if (state.quotaDisabledUntil > now) values.push(state.quotaDisabledUntil - now);
+                if (routeKey && state.modelCooldowns?.[routeKey] > now) {
+                    values.push(state.modelCooldowns[routeKey] - now);
                 }
                 return values;
             })
@@ -1105,7 +1502,7 @@ class RequestHandler {
         } catch (error) {
             const status = Number(error?.status ?? error?.statusCode);
             if (Number.isInteger(status)) {
-                this._autoDisableAccountForStatus(authIndex, {
+                this._markImmediateRateLimitIfNeeded(authIndex, null, {
                     message: error.message,
                     status,
                 });
@@ -1170,17 +1567,10 @@ class RequestHandler {
 
         const status = Number(errorDetails?.status);
         this._recordUsageAttemptError(requestId, source, errorDetails);
-        this._autoDisableAccountForStatus(source, errorDetails);
         const modelName = this._normalizeRouteModel(
             errorDetails?.modelName || this.requestModelBindings.get(requestId)
         );
-        if (status === 429) {
-            const state = this._getAccountRouteState(source);
-            const modelCooldownUntil = modelName ? state.modelCooldowns?.[modelName] || 0 : state.cooldownUntil;
-            if (state.lastStatus !== 429 || modelCooldownUntil <= Date.now()) {
-                this._markAccount429ForModel(source, modelName, errorDetails);
-            }
-        }
+        this._markImmediateRateLimitIfNeeded(source, modelName, errorDetails);
         const immediate = this._shouldSwitchImmediatelyForStatus(status);
         const thresholdReached = this.config.failureThreshold > 0 && failureCount >= this.config.failureThreshold;
         if (!immediate && !thresholdReached) return { success: false, switched: false };
@@ -1790,6 +2180,19 @@ class RequestHandler {
     async _ensureBrowserBackedRequestReady(res, options = {}) {
         const { logPrefix = "Request", waitErrorType = null, waitOptions, authIndex, requestId } = options;
         const routeModel = this.requestModelBindings.get(requestId) || null;
+        const routingDecision = this._getModelRoutingDecision(routeModel);
+        if (!routingDecision.allowed) {
+            this._sendErrorResponse(
+                res,
+                400,
+                routeModel
+                    ? `Model "${routeModel}" is not enabled in this server's model pool.`
+                    : "A model is required by this server's model pool policy.",
+                waitErrorType
+            );
+            this._markTrackedEarlyExitIfNeeded(res, routingDecision.reason || "Model is outside the configured pool.");
+            return false;
+        }
 
         // HTTP starts listening before the initial context pool is ready. A
         // health check or client request during that window must wait for the
@@ -1828,6 +2231,18 @@ class RequestHandler {
                 if (cooldownMs > 0) {
                     res.setHeader("Retry-After", Math.ceil(cooldownMs / 1000));
                     this._sendErrorResponse(res, 429, "All accounts are temporarily rate-limited.", waitErrorType);
+                } else if (routingDecision.routing.strict) {
+                    // Never fall back to the global recovery account when a
+                    // strict model pool has no READY member: that would route
+                    // a model to a credential owned by another pool.
+                    this._sendErrorResponse(
+                        res,
+                        503,
+                        `No READY account is available in the configured pool for model "${routeModel}".`,
+                        waitErrorType
+                    );
+                    this._markTrackedEarlyExitIfNeeded(res, "Strict model pool has no READY account.");
+                    return false;
                 } else {
                     // No live connection exists yet. Run the normal recovery
                     // path so an initial request can initialize an account
@@ -1838,7 +2253,7 @@ class RequestHandler {
                         return false;
                     }
 
-                    const recoveredAuthIndex = this._selectRequestAuthIndex();
+                    const recoveredAuthIndex = this._selectRequestAuthIndex([], routeModel);
                     if (recoveredAuthIndex < 0) {
                         this._sendErrorResponse(res, 503, "No healthy account connection is available.", waitErrorType);
                         this._markTrackedEarlyExitIfNeeded(res, "No schedulable account connection.");
@@ -1858,11 +2273,13 @@ class RequestHandler {
         // waited behind another request that received 429. Re-check the
         // quarantine immediately before touching the browser connection.
         const targetRouteState = this._getAccountRouteState(targetAuthIndex);
-        const targetModelCooldownUntil = routeModel ? targetRouteState.modelCooldowns?.[routeModel] || 0 : 0;
+        const targetRouteKey = routeModel ? this._getModelRouteKey(routeModel) : null;
+        const targetModelCooldownUntil = targetRouteKey ? targetRouteState.modelCooldowns?.[targetRouteKey] || 0 : 0;
         const targetUsageExhausted =
             this._isPerAccountUsageRoutingEnabled() && targetRouteState.usageExhausted === true;
         if (
             targetRouteState.cooldownUntil > Date.now() ||
+            targetRouteState.quotaDisabledUntil > Date.now() ||
             targetModelCooldownUntil > Date.now() ||
             targetUsageExhausted
         ) {
@@ -2021,6 +2438,7 @@ class RequestHandler {
             return false;
         }
 
+        this._bindRequestAuthIndex(requestId, newAuthIndex);
         tracker.attemptedAuthIndices.add(newAuthIndex);
         return true;
     }
@@ -2258,8 +2676,10 @@ class RequestHandler {
     // Process standard Google API requests
     async processRequest(req, res) {
         const requestId = this._generateRequestId();
-        const requestAuthIndex = this._selectRequestAuthIndex([], this._getRequestedModel(req));
+        const requestedModel = this._getRequestedModel(req);
+        const requestAuthIndex = this._selectRequestAuthIndex([], requestedModel);
         this._bindRequestAuthIndex(requestId, requestAuthIndex);
+        this.requestModelBindings.set(requestId, requestedModel);
         this._startTrackedRequest(requestId, req, {
             apiFormat: "gemini",
             requestCategory: this._categorizeRequest(req.path, "request"),
@@ -2346,8 +2766,10 @@ class RequestHandler {
     // Process OpenAI embeddings requests
     async processOpenAIEmbeddingsRequest(req, res) {
         const requestId = this._generateRequestId();
-        const requestAuthIndex = this._selectRequestAuthIndex([], this._getRequestedModel(req));
+        const requestedModel = this._getRequestedModel(req);
+        const requestAuthIndex = this._selectRequestAuthIndex([], requestedModel);
         this._bindRequestAuthIndex(requestId, requestAuthIndex);
+        this.requestModelBindings.set(requestId, requestedModel);
         this._startTrackedRequest(requestId, req, {
             apiFormat: "openai",
             isStreaming: false,
@@ -2416,8 +2838,10 @@ class RequestHandler {
     // Process File Upload requests
     async processUploadRequest(req, res) {
         const requestId = this._generateRequestId();
-        const requestAuthIndex = this._selectRequestAuthIndex([], this._getRequestedModel(req));
+        const requestedModel = this._getRequestedModel(req);
+        const requestAuthIndex = this._selectRequestAuthIndex([], requestedModel);
         this._bindRequestAuthIndex(requestId, requestAuthIndex);
+        this.requestModelBindings.set(requestId, requestedModel);
         this.logger.info(`[Upload] Processing upload request ${req.method} ${req.path}, request ID: ${requestId}`);
         this._startTrackedRequest(requestId, req, {
             apiFormat: "upload",
@@ -2513,8 +2937,10 @@ class RequestHandler {
     // Process OpenAI format requests
     async processOpenAIRequest(req, res) {
         const requestId = this._generateRequestId();
-        const requestAuthIndex = this._selectRequestAuthIndex([], this._getRequestedModel(req));
+        const requestedModel = this._getRequestedModel(req);
+        const requestAuthIndex = this._selectRequestAuthIndex([], requestedModel);
         this._bindRequestAuthIndex(requestId, requestAuthIndex);
+        this.requestModelBindings.set(requestId, requestedModel);
         this._startTrackedRequest(requestId, req, {
             apiFormat: "openai",
             isStreaming: req.body.stream === true,
@@ -2611,6 +3037,13 @@ class RequestHandler {
                         const initialStatus = Number(initialMessage?.status);
                         if (initialMessage.event_type === "error") {
                             this._recordUsageAttemptError(requestId, currentQueueAuthIndex, initialMessage);
+                            if (!isUserAbortedError(initialMessage) && Number.isFinite(initialStatus)) {
+                                this._markImmediateRateLimitIfNeeded(
+                                    currentQueueAuthIndex,
+                                    this._getProxyRequestModel(proxyRequest),
+                                    initialMessage
+                                );
+                            }
                         }
                         if (
                             initialMessage.event_type === "error" &&
@@ -2621,11 +3054,6 @@ class RequestHandler {
                         ) {
                             this.logger.warn(
                                 `[Request] OpenAI real stream received ${initialStatus}, preparing retry...`
-                            );
-                            this._markImmediateRateLimitIfNeeded(
-                                currentQueueAuthIndex,
-                                this._getProxyRequestModel(proxyRequest),
-                                initialMessage
                             );
                             this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
 
@@ -2883,8 +3311,10 @@ class RequestHandler {
     // Process OpenAI Response API format requests
     async processOpenAIResponseRequest(req, res) {
         const requestId = this._generateRequestId();
-        const requestAuthIndex = this._selectRequestAuthIndex([], this._getRequestedModel(req));
+        const requestedModel = this._getRequestedModel(req);
+        const requestAuthIndex = this._selectRequestAuthIndex([], requestedModel);
         this._bindRequestAuthIndex(requestId, requestAuthIndex);
+        this.requestModelBindings.set(requestId, requestedModel);
         this._startTrackedRequest(requestId, req, {
             apiFormat: "response_api",
             isStreaming: req.body.stream === true,
@@ -3036,6 +3466,13 @@ class RequestHandler {
                         const initialStatus = Number(initialMessage?.status);
                         if (initialMessage.event_type === "error") {
                             this._recordUsageAttemptError(requestId, currentQueueAuthIndex, initialMessage);
+                            if (!isUserAbortedError(initialMessage) && Number.isFinite(initialStatus)) {
+                                this._markImmediateRateLimitIfNeeded(
+                                    currentQueueAuthIndex,
+                                    this._getProxyRequestModel(proxyRequest),
+                                    initialMessage
+                                );
+                            }
                         }
                         if (
                             initialMessage.event_type === "error" &&
@@ -3046,11 +3483,6 @@ class RequestHandler {
                         ) {
                             this.logger.warn(
                                 `[Request] OpenAI Response API real stream received ${initialStatus}, preparing retry...`
-                            );
-                            this._markImmediateRateLimitIfNeeded(
-                                currentQueueAuthIndex,
-                                this._getProxyRequestModel(proxyRequest),
-                                initialMessage
                             );
                             this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
 
@@ -3331,8 +3763,10 @@ class RequestHandler {
     // Process Claude API format requests
     async processClaudeRequest(req, res) {
         const requestId = this._generateRequestId();
-        const requestAuthIndex = this._selectRequestAuthIndex([], this._getRequestedModel(req));
+        const requestedModel = this._getRequestedModel(req);
+        const requestAuthIndex = this._selectRequestAuthIndex([], requestedModel);
         this._bindRequestAuthIndex(requestId, requestAuthIndex);
+        this.requestModelBindings.set(requestId, requestedModel);
         this._startTrackedRequest(requestId, req, {
             apiFormat: "claude",
             isStreaming: req.body.stream === true,
@@ -3430,6 +3864,13 @@ class RequestHandler {
                         const initialStatus = Number(initialMessage?.status);
                         if (initialMessage.event_type === "error") {
                             this._recordUsageAttemptError(requestId, currentQueueAuthIndex, initialMessage);
+                            if (!isUserAbortedError(initialMessage) && Number.isFinite(initialStatus)) {
+                                this._markImmediateRateLimitIfNeeded(
+                                    currentQueueAuthIndex,
+                                    this._getProxyRequestModel(proxyRequest),
+                                    initialMessage
+                                );
+                            }
                         }
                         if (
                             initialMessage.event_type === "error" &&
@@ -3440,11 +3881,6 @@ class RequestHandler {
                         ) {
                             this.logger.warn(
                                 `[Request] Claude real stream received ${initialStatus}, preparing retry...`
-                            );
-                            this._markImmediateRateLimitIfNeeded(
-                                currentQueueAuthIndex,
-                                this._getProxyRequestModel(proxyRequest),
-                                initialMessage
                             );
                             this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
 
@@ -3691,8 +4127,10 @@ class RequestHandler {
     // Process Claude count tokens request
     async processClaudeCountTokens(req, res) {
         const requestId = this._generateRequestId();
-        const requestAuthIndex = this._selectRequestAuthIndex([], this._getRequestedModel(req));
+        const requestedModel = this._getRequestedModel(req);
+        const requestAuthIndex = this._selectRequestAuthIndex([], requestedModel);
         this._bindRequestAuthIndex(requestId, requestAuthIndex);
+        this.requestModelBindings.set(requestId, requestedModel);
         this.logger.info(`[Request] Claude count tokens request started, request ID: ${requestId}`);
         this._startTrackedRequest(requestId, req, {
             apiFormat: "claude",
@@ -3839,8 +4277,10 @@ class RequestHandler {
     // Mirrors OpenAI's /v1/responses/input_tokens by returning only the request-side token count.
     async processOpenAIResponseInputTokens(req, res) {
         const requestId = this._generateRequestId();
-        const requestAuthIndex = this._selectRequestAuthIndex([], this._getRequestedModel(req));
+        const requestedModel = this._getRequestedModel(req);
+        const requestAuthIndex = this._selectRequestAuthIndex([], requestedModel);
         this._bindRequestAuthIndex(requestId, requestAuthIndex);
+        this.requestModelBindings.set(requestId, requestedModel);
         this.logger.info(`[Request] OpenAI Response input_tokens request started, request ID: ${requestId}`);
         this._startTrackedRequest(requestId, req, {
             apiFormat: "response_api",
@@ -4422,6 +4862,13 @@ class RequestHandler {
             const headerStatus = Number(headerMessage?.status);
             if (headerMessage.event_type === "error") {
                 this._recordUsageAttemptError(proxyRequest.request_id, currentQueueAuthIndex, headerMessage);
+                if (!isUserAbortedError(headerMessage) && Number.isFinite(headerStatus)) {
+                    this._markImmediateRateLimitIfNeeded(
+                        currentQueueAuthIndex,
+                        this._getProxyRequestModel(proxyRequest),
+                        headerMessage
+                    );
+                }
             }
             if (
                 headerMessage.event_type === "error" &&
@@ -4432,11 +4879,6 @@ class RequestHandler {
                 this._shouldSwitchImmediatelyForStatus(headerStatus)
             ) {
                 this.logger.warn(`[Request] Gemini real stream received ${headerStatus}, preparing retry...`);
-                this._markImmediateRateLimitIfNeeded(
-                    currentQueueAuthIndex,
-                    this._getProxyRequestModel(proxyRequest),
-                    headerMessage
-                );
                 this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
 
                 const retryPrepared = await this._prepareImmediateStatusRetry(
@@ -4834,10 +5276,11 @@ class RequestHandler {
                             reason,
                             status: 503,
                         };
+                        this._bindRequestAuthIndex(proxyRequest.request_id, currentAuthIndex);
                         this._advanceProxyRequestAttempt(proxyRequest);
                         currentQueue = this.connectionRegistry.createMessageQueue(
                             proxyRequest.request_id,
-                            this._getRequestAuthIndex(proxyRequest.request_id, currentAuthIndex),
+                            currentAuthIndex,
                             proxyRequest.request_attempt_id
                         );
                         currentQueueAuthIndex = currentAuthIndex;
@@ -4864,14 +5307,11 @@ class RequestHandler {
                 this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
 
                 const errorStatus = Number(errorPayload?.status);
-                this._autoDisableAccountForStatus(currentQueueAuthIndex, errorPayload);
-                if (errorStatus === 429) {
-                    this._markAccount429ForModel(
-                        currentQueueAuthIndex,
-                        this._getProxyRequestModel(proxyRequest),
-                        errorPayload
-                    );
-                }
+                this._markImmediateRateLimitIfNeeded(
+                    currentQueueAuthIndex,
+                    this._getProxyRequestModel(proxyRequest),
+                    errorPayload
+                );
                 const isNonRetryableEmbeddingClientError =
                     (errorStatus === 400 || errorStatus === 404) &&
                     this._categorizeRequest(proxyRequest?.path, "request") === "embedding";
@@ -4988,7 +5428,9 @@ class RequestHandler {
                     // Routing-layer WS-not-ready: count it as a drop for this
                     // account so a never-ready context trips crash-loop
                     // quarantine instead of being re-picked on every retry.
-                    this.recordWsDisconnect(currentQueueAuthIndex >= 0 ? currentQueueAuthIndex : this.currentAuthIndex).catch(() => {});
+                    this.recordWsDisconnect(
+                        currentQueueAuthIndex >= 0 ? currentQueueAuthIndex : this.currentAuthIndex
+                    ).catch(() => {});
                     lastError = {
                         message: `WebSocket connection not ready before retry on account #${this.currentAuthIndex}.`,
                         status: 503,

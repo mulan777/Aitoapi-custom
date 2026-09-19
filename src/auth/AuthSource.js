@@ -29,6 +29,11 @@ class AuthSource {
         this.initialIndices = [];
         this.accountNameMap = new Map();
         this.accountStatusMap = new Map();
+        // Optional per-credential model-pool labels.  Auth files may expose
+        // `modelGroups` (or the legacy-friendly `modelPoolGroups`) as an
+        // array; an absent value leaves the credential eligible for all
+        // configured groups.
+        this.accountModelGroupsMap = new Map();
         // Map any valid index -> canonical (latest) index for the same account email
         this.canonicalIndexMap = new Map();
         // Duplicate groups (email -> kept + duplicates)
@@ -103,10 +108,42 @@ class AuthSource {
             const files = fs.readdirSync(configDir);
             const authFiles = files.filter(file => /^auth-\d+\.json$/.test(file)).sort();
             indices = authFiles.map(file => parseInt(file.match(/^auth-(\d+)\.json$/)[1], 10));
+            // Only changes that can affect account topology/routing should
+            // trigger a full reload and ContextPool rebalance. BrowserManager
+            // periodically refreshes cookies/origins in these files; using
+            // size + mtime made those internal writes look like operator
+            // changes and repeatedly aborted background context warm-up.
             this.currentScanSignature = JSON.stringify(
                 authFiles.map(file => {
-                    const stat = fs.statSync(path.join(configDir, file));
-                    return [file, stat.size, Math.trunc(stat.mtimeMs)];
+                    const filePath = path.join(configDir, file);
+                    try {
+                        const authData = JSON.parse(fs.readFileSync(filePath, "utf8"));
+                        return [
+                            file,
+                            authData.accountName || null,
+                            authData.disabled === true,
+                            authData.disabledAt || null,
+                            authData.disabledReason || null,
+                            Number.isFinite(Number(authData.disabledStatus)) ? Number(authData.disabledStatus) : null,
+                            authData.expired === true,
+                            Array.isArray(authData.modelGroups)
+                                ? authData.modelGroups
+                                      .map(value => String(value).trim().toLowerCase())
+                                      .filter(Boolean)
+                                      .sort()
+                                : Array.isArray(authData.modelPoolGroups)
+                                  ? authData.modelPoolGroups
+                                        .map(value => String(value).trim().toLowerCase())
+                                        .filter(Boolean)
+                                        .sort()
+                                  : [],
+                        ];
+                    } catch {
+                        // Invalid/unreadable files must still change the scan
+                        // signature so validation can remove or restore them.
+                        const stat = fs.statSync(filePath);
+                        return [file, "invalid", stat.size, Math.trunc(stat.mtimeMs)];
+                    }
                 })
             );
         } catch (error) {
@@ -129,6 +166,7 @@ class AuthSource {
             this.disabledIndices = [];
             this.accountNameMap.clear();
             this.accountStatusMap.clear();
+            this.accountModelGroupsMap.clear();
             this.canonicalIndexMap.clear();
             this.duplicateGroups = [];
             return;
@@ -138,6 +176,7 @@ class AuthSource {
         const invalidSourceDescriptions = [];
         this.accountNameMap.clear(); // Clear old names before re-validating
         this.accountStatusMap.clear();
+        this.accountModelGroupsMap.clear();
         this.canonicalIndexMap.clear();
         this.duplicateGroups = [];
         this.expiredIndices = [];
@@ -158,6 +197,13 @@ class AuthSource {
                             ? Number(authData.disabledStatus)
                             : null,
                     });
+                    const modelGroups = authData.modelGroups ?? authData.modelPoolGroups;
+                    this.accountModelGroupsMap.set(
+                        index,
+                        Array.isArray(modelGroups)
+                            ? [...new Set(modelGroups.map(value => String(value).trim().toLowerCase()).filter(Boolean))]
+                            : []
+                    );
                     // Track expired status from auth file
                     if (authData.expired === true) {
                         this.expiredIndices.push(index);
@@ -304,6 +350,10 @@ class AuthSource {
 
     getStatusMetadata(index) {
         return this.accountStatusMap.get(index) || { disabledAt: null, disabledReason: null, disabledStatus: null };
+    }
+
+    getModelGroups(index) {
+        return this.accountModelGroupsMap.get(index) || [];
     }
 
     getRotationIndices() {

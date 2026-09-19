@@ -132,6 +132,7 @@ async function main() {
     const exhausted = rh._getAccountRouteState(68);
     exhausted.crashLoopEpisodes = 3; // past the old WS_CRASH_MAX_EPISODES — still probed (never give up)
     exhausted.wsCrashLoopUntil = 0;
+    exhausted.autoHealNextProbeAt = Date.now() - 1;
 
     // #70 is disabled as crash_loop but still inside its quarantine window.
     const enablesBefore = mockAuthSource.enableCalls;
@@ -152,6 +153,7 @@ async function main() {
 
     // ---- 4. probe restores a healthy account once the quarantine window elapsed ----
     rh._getAccountRouteState(70).wsCrashLoopUntil = 0;
+    rh._getAccountRouteState(70).autoHealNextProbeAt = Date.now() - 1;
     await rh._runAutoHealProbe();
 
     assert.strictEqual(mockAuthSource.isDisabled(70), false, "a healthy account must be restored to rotation");
